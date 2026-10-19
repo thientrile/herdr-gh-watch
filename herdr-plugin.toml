@@ -1,0 +1,21 @@
+id = "personal.gh-watch"
+name = "GitHub Watch"
+version = "0.1.0"
+min_herdr_version = "0.9.1"
+description = "Receive GitHub webhooks (reviews, CI, merges) through the Cloudflare tunnel and notify the matching herdr agent"
+platforms = ["linux"]
+
+[[startup]]
+command = ["sh", "start.sh"]
+
+[[actions]]
+id = "restart"
+title = "GitHub Watch: restart receiver"
+contexts = ["global"]
+command = ["sh", "start.sh", "--restart"]
+
+[[actions]]
+id = "status"
+title = "GitHub Watch: status"
+contexts = ["global"]
+command = ["sh", "start.sh", "--status"]
