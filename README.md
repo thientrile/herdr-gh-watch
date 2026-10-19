@@ -21,7 +21,7 @@ The agent then reads the PR itself with `gh`. Events from the same PR are deboun
 Needs herdr ≥ 0.9.1, Linux, `python3`, `git`, and the `gh` CLI (logged in) for your agents.
 
 ```sh
-herdr plugin install github:thientrile/herdr-gh-watch
+herdr plugin install thientrile/herdr-gh-watch
 ```
 
 The receiver starts with herdr. On first start it writes a random webhook secret to the plugin config dir:
