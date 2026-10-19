@@ -12,6 +12,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import subprocess
 import sys
@@ -25,7 +26,7 @@ PORT = int(os.environ.get("GH_WATCH_PORT", "8787"))
 DRY_RUN = os.environ.get("GH_WATCH_DRY_RUN") == "1"
 MAX_BODY = 1_000_000
 STATE = os.environ.get("HERDR_PLUGIN_STATE_DIR") or os.path.expanduser("~/.local/state/herdr-gh-watch")
-MARK = "agy-review:"
+MARK = "gh-watch-review:"
 os.environ["PATH"] = os.path.expanduser("~/.local/bin") + ":" + os.environ.get("PATH", "")
 SAFE = re.compile(r"[^A-Za-z0-9._/-]")
 
@@ -66,6 +67,15 @@ def ignored_users():
         return {line.strip() for line in open(os.path.join(CONFIG, "ignore_users")) if line.strip()}
     except OSError:
         return set()
+
+
+def config_cmd(name):
+    """First non-comment line of a config file as an argv list, or [] when the file is missing or empty."""
+    try:
+        lines = [l.strip() for l in open(os.path.join(CONFIG, name)) if l.strip() and not l.startswith("#")]
+    except OSError:
+        return []
+    return shlex.split(lines[0]) if lines else []
 
 
 def debounced(key):
@@ -152,8 +162,8 @@ def handle(event, payload, repos):
         return "ignored"
     title, message, number = summary
     # only comments and reviews are skipped when you wrote them; CI results and merges you triggered still matter
-    is_agy = str((payload.get("review") or {}).get("body") or "").startswith(MARK)  # boolean only, the text is never forwarded
-    if event in ("pull_request_review", "issue_comment", "pull_request_review_comment") and not is_agy \
+    is_auto_review = str((payload.get("review") or {}).get("body") or "").startswith(MARK)  # boolean only, the text is never forwarded
+    if event in ("pull_request_review", "issue_comment", "pull_request_review_comment") and not is_auto_review \
             and safe(payload.get("sender", {}).get("login", "")) in ignored_users():
         return "ignored (own activity)"
     kind = "feedback" if event in ("pull_request_review", "issue_comment", "pull_request_review_comment") else event
@@ -161,8 +171,12 @@ def handle(event, payload, repos):
     if number and debounced((repo, number, kind, outcome)):
         return "debounced"
     herdr("notification", "show", title, "--sound", "request")
-    if not DRY_RUN:
-        subprocess.run(["tg-notify", f"GitHub: {title}"], capture_output=True, timeout=15)
+    notify = config_cmd("notify_cmd")  # optional extra channel, e.g. a Telegram sender; gets the title as its last argument
+    if notify and not DRY_RUN:
+        try:
+            subprocess.run([*notify, f"GitHub: {title}"], capture_output=True, timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            pass
     head = (payload.get("pull_request") or payload.get("workflow_run") or {}).get("head", {}).get("ref") \
         or payload.get("workflow_run", {}).get("head_branch", "")
     pane = target_pane(local, head)
@@ -182,9 +196,17 @@ P1 = bug, security problem, data loss, or breaks a stated convention. P2 = shoul
 No praise, no summary of the diff, no preamble."""
 
 
+def review_prompt():
+    """review_prompt.txt replaces the default prompt (project conventions, language)."""
+    try:
+        return open(os.path.join(CONFIG, "review_prompt.txt")).read().strip() or REVIEW_PROMPT
+    except OSError:
+        return REVIEW_PROMPT
+
+
 def review_repos():
     try:
-        return {l.strip() for l in open(os.path.join(CONFIG, "agy_review.txt")) if l.strip() and not l.startswith("#")}
+        return {l.strip() for l in open(os.path.join(CONFIG, "review_repos")) if l.strip() and not l.startswith("#")}
     except OSError:
         return set()
 
@@ -206,16 +228,22 @@ def claim_review(repo, number):
 
 
 def run_review(repo, number, post):
+    command = config_cmd("review_cmd")
+    if not command:
+        return "no review_cmd"
     diff = subprocess.run(["gh", "pr", "diff", str(number), "--repo", repo], capture_output=True, text=True, timeout=60).stdout
     if not diff.strip():
         return "no diff"
     note = "\n[diff truncated]" if len(diff) > 60000 else ""
-    prompt = f"{REVIEW_PROMPT}\n<diff>\n{diff[:60000]}{note}\n</diff>"
+    prompt = f"{review_prompt()}\n<diff>\n{diff[:60000]}{note}\n</diff>"
     with tempfile.TemporaryDirectory() as empty:  # an empty directory: the reviewer can read the diff only, never the repo
-        out = subprocess.run(["agy", "--mode", "plan", f"--print={prompt}"], cwd=empty, capture_output=True, text=True, timeout=400).stdout.strip()
+        # `{prompt}` inside an argument is replaced by the prompt; without one the prompt goes to stdin
+        argv = [arg.replace("{prompt}", prompt) for arg in command]
+        stdin = None if argv != command else prompt
+        out = subprocess.run(argv, cwd=empty, input=stdin, capture_output=True, text=True, timeout=400).stdout.strip()
     if not out:
         return "empty review"
-    body = f"{MARK} reviewer phu (tu dong, mot vong). Day la goi y, khong phai quyet dinh merge.\n\n{out[:6000]}"
+    body = f"{MARK} automated second-opinion review (one round). Suggestions only, not a merge decision.\n\n{out[:6000]}"
     if not post:
         print("---- review (not posted) ----\n" + body, flush=True)
         return "dry"
@@ -227,9 +255,9 @@ def maybe_review(event, payload):
     if event != "pull_request" or payload.get("action") not in ("opened", "ready_for_review"):
         return
     pr, repo = payload.get("pull_request") or {}, payload.get("repository", {}).get("full_name", "")
-    if repo not in review_repos() or pr.get("draft") or not claim_review(repo, pr.get("number")):
+    if repo not in review_repos() or not config_cmd("review_cmd") or pr.get("draft") or not claim_review(repo, pr.get("number")):
         return
-    threading.Thread(target=lambda: print(f"agy review {repo}#{pr['number']}: {run_review(repo, pr['number'], not DRY_RUN)}", flush=True), daemon=True).start()
+    threading.Thread(target=lambda: print(f"review {repo}#{pr['number']}: {run_review(repo, pr['number'], not DRY_RUN)}", flush=True), daemon=True).start()
 
 
 class Hook(BaseHTTPRequestHandler):
