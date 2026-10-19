@@ -45,6 +45,7 @@ All files live in `$cfg`; see [`examples/`](examples). Only `repos.tsv` is neede
 | `review_repos` | Optional. Repos (`owner/name`, one per line) that get one automated review when a PR is opened or marked ready. |
 | `review_cmd` | Optional, needed for reviews. The reviewer command, e.g. `claude -p`. An argument containing `{prompt}` gets the prompt; otherwise the prompt goes to stdin. Its output is posted as a PR review comment starting with `gh-watch-review:`. |
 | `review_prompt.txt` | Optional. Replaces the default review prompt, e.g. to describe your project's conventions or ask for another language. The diff is appended after it. |
+| `tunnel_cmd` | Optional. A tunnel command (e.g. `cloudflared tunnel run gh-watch`) started with the receiver and stopped with it; its output goes to `receiver.log`. Read at start only, so restart after editing. Leave it out if you run your tunnel some other way. |
 
 Lines starting with `#` are comments. The port is `GH_WATCH_PORT` (default 8787); `GH_WATCH_DRY_RUN=1` logs what would be sent instead of sending it.
 
@@ -53,11 +54,40 @@ Lines starting with `#` are comments. The port is `GH_WATCH_PORT` (default 8787)
 The receiver binds to `127.0.0.1` only. Put a tunnel in front of it, for example:
 
 ```sh
-cloudflared tunnel --url http://127.0.0.1:8787     # quick tunnel; use a named tunnel for a stable URL
+cloudflared tunnel --url http://127.0.0.1:8787     # quick tunnel; see below for a stable URL
 ngrok http 8787
 ```
 
 Any reverse proxy works as long as it forwards `POST /github` with its headers.
+
+### Stable custom domain
+
+Quick tunnels change URL on every start, so the webhook breaks. For a fixed hostname:
+
+**cloudflared named tunnel** (domain on Cloudflare):
+
+```sh
+cloudflared tunnel login
+cloudflared tunnel create gh-watch
+cloudflared tunnel route dns gh-watch gh-watch.example.com
+```
+
+`~/.cloudflared/config.yml`:
+
+```yaml
+tunnel: gh-watch
+credentials-file: /home/you/.cloudflared/<tunnel-id>.json
+ingress:
+  - hostname: gh-watch.example.com
+    service: http://127.0.0.1:8787
+  - service: http_status:404
+```
+
+Run it with `cloudflared tunnel run gh-watch`.
+
+**ngrok reserved domain**: reserve a domain in the ngrok dashboard, then run `ngrok http --url=gh-watch.example.com 8787`.
+
+The webhook Payload URL is then `https://gh-watch.example.com/github`. To have the plugin start and stop the tunnel, put the run command in `$cfg/tunnel_cmd` (see [`examples/tunnel_cmd`](examples/tunnel_cmd)).
 
 ## Create the GitHub webhook
 
@@ -81,7 +111,7 @@ GitHub sends a `ping` first; a green check means the signature matched. Then add
 
 ```sh
 herdr plugin link "$PWD"
-python3 test_receiver.py     # describe() and the signature check; no herdr needed
+python3 test_receiver.py     # describe(), the signature check and tunnel_cmd; no herdr needed
 HERDR_PLUGIN_CONFIG_DIR="$cfg" python3 receiver.py --review-once owner/repo 12   # print a review without posting it (add --post to post)
 ```
 

@@ -14,6 +14,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -260,6 +261,18 @@ def maybe_review(event, payload):
     threading.Thread(target=lambda: print(f"review {repo}#{pr['number']}: {run_review(repo, pr['number'], not DRY_RUN)}", flush=True), daemon=True).start()
 
 
+def start_tunnel():
+    """Runs tunnel_cmd next to the receiver, its output into the receiver log; None when unset or not runnable."""
+    command = config_cmd("tunnel_cmd")
+    if not command:
+        return None
+    try:
+        return subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=sys.stdout, stderr=sys.stderr)
+    except OSError as error:
+        print(f"tunnel_cmd failed to start: {error}", file=sys.stderr, flush=True)
+        return None
+
+
 class Hook(BaseHTTPRequestHandler):
     secret = b""
 
@@ -298,4 +311,12 @@ if __name__ == "__main__":
         print(run_review(sys.argv[2], int(sys.argv[3]), "--post" in sys.argv))
         raise SystemExit
     Hook.secret = load_secret()
-    HTTPServer(("127.0.0.1", PORT), Hook).serve_forever()
+    server = HTTPServer(("127.0.0.1", PORT), Hook)
+    # shortcut: the tunnel stops with a normal stop (SIGTERM, as start.sh --restart sends); a SIGKILL leaves it running
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    tunnel = start_tunnel()
+    try:
+        server.serve_forever()
+    finally:
+        if tunnel:
+            tunnel.terminate()

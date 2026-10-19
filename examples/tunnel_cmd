@@ -1,0 +1,4 @@
+# optional: started with the receiver and stopped with it; output goes to receiver.log.
+# Skip this file if you already run your tunnel some other way (two tunnels for one hostname conflict).
+cloudflared tunnel run gh-watch
+# ngrok http --url=gh-watch.example.com 8787

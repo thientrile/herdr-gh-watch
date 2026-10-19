@@ -1,4 +1,4 @@
-"""Self-check for describe() and the webhook signature check. Run: python3 test_receiver.py (no herdr needed)."""
+"""Self-check for describe(), the webhook signature check and tunnel_cmd. Run: python3 test_receiver.py (no herdr needed)."""
 import hashlib
 import hmac
 import json
@@ -49,4 +49,14 @@ assert post("/github", body, "pull_request_review", secret=b"wrong")[0] == 401
 assert post("/other", body, "pull_request_review")[0] == 404
 assert post("/github", body, "pull_request_review") == (200, "ignored")  # acme/app is not in repos.tsv
 server.shutdown()
+
+assert receiver.start_tunnel() is None  # no tunnel_cmd: nothing is started
+tunnel_cmd = os.path.join(receiver.CONFIG, "tunnel_cmd")
+open(tunnel_cmd, "w").write("# comment\nno-such-tunnel-binary --x\n")
+assert receiver.start_tunnel() is None  # not runnable: logged, receiver keeps going
+open(tunnel_cmd, "w").write("sleep 30\n")
+tunnel = receiver.start_tunnel()
+assert tunnel.poll() is None
+tunnel.terminate()
+assert tunnel.wait(5) is not None
 print("ok")
