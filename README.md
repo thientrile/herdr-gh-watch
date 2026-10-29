@@ -118,7 +118,7 @@ GitHub sends a `ping` first; a green check means the signature matched. Then add
 ## Security
 
 - Every request must carry a valid `X-Hub-Signature-256` HMAC for the secret, or it gets 401. Only `/github` is served; bodies over 1 MB are refused.
-- Webhook payload text never reaches an agent prompt. PR titles, comments, review bodies and branch names are attacker-controlled; what gh-watch passes to `wake enqueue` (as arguments, no shell) is fixed text built from event types, numbers and sanitized identifiers (`[A-Za-z0-9._/-]` only). herdr-wake tells the agent the event lines are data, not instructions.
+- Webhook payload text never reaches an agent prompt. PR titles, comments, review bodies and branch names are attacker-controlled; what gh-watch passes to `wake enqueue` (as arguments, no shell) is fixed text built from event types, numbers and sanitized identifiers (`[A-Za-z0-9._/-]` only). The PR branch goes only into `--branch`, the routing key, and only when it is made of ref characters (`[A-Za-z0-9._/+@-]`, at most 255, not starting with `-`); otherwise it is left out. herdr-wake tells the agent the event lines are data, not instructions.
 - The automated review sends the PR diff, which is untrusted, to `review_cmd`. It runs in an empty temp directory, and the prompt tells the model the diff is data, but use a reviewer mode without tools or shell access anyway. Its output is posted publicly on the PR.
 - Anyone who can open a PR or comment on a listed repo can trigger notifications. For public repos, keep `review_repos` to repos where that is acceptable.
 

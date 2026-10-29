@@ -149,12 +149,32 @@ assert send("workflow_run", {**fork_event, "repository": {**repo, "default_branc
     == (200, "wake enqueued") and calls == []
 assert send("pull_request_review", {**attack, "pull_request": {"number": 7, "head": {"ref": "-x"}}}, "g-9")[0] == 200
 assert "--branch" not in wake_calls()[-1]  # a value starting with "-" would be read as an option
+assert send("pull_request_review", {**attack, "pull_request": {"number": 7, "head": {"ref": "feature/c++"}}}, "g-10")[0] == 200
+assert wake_calls()[-1][-2:] == ["--branch", "feature/c++"]  # the exact ref, or the worker routes to another branch
+assert send("pull_request_review", {**attack, "pull_request": {"number": 7, "head": {"ref": "b" * 300}}}, "g-11")[0] == 200
+assert "--branch" not in wake_calls()[-1]  # too long to be a ref: dropped, not cut to a different name
 assert send("pull_request_review", attack, "-g")[0] == 400
 time.sleep(0.5)  # notifications run in threads
 herdr_calls = open(os.path.join(checkout, "herdr-calls")).read().splitlines()
 assert herdr_calls and all(c.startswith("notification show") for c in herdr_calls), herdr_calls
 assert any("(not queued for the agent)" in c for c in herdr_calls)  # wake failed: the user still hears about it
 server.shutdown()
+
+receiver.HERDR_TIMEOUT = 1
+for mode in ("exit 1", "sleep 3"):  # every herdr call checks exit code, timeout and a missing binary
+    open(fake_herdr, "w").write(f"#!/bin/sh\n{mode}\n")
+    try:
+        receiver.herdr("notification", "show", "x")
+        raise AssertionError(mode)
+    except RuntimeError:
+        pass
+receiver.HERDR = os.path.join(checkout, "no-such-herdr")
+try:
+    receiver.herdr("notification", "show", "x")
+    raise AssertionError("missing herdr")
+except RuntimeError:
+    pass
+receiver.notify_user("x")  # a failed notification is logged, never fatal
 
 receiver.STATE = tempfile.mkdtemp()  # concurrent requests claim the one review round once
 claims = []

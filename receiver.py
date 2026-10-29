@@ -27,6 +27,7 @@ CONFIG = os.environ.get("HERDR_PLUGIN_CONFIG_DIR") or os.path.expanduser("~/.con
 HERDR = os.environ.get("HERDR_BIN_PATH") or "herdr"
 WAKE = os.environ.get("HERDR_WAKE_BIN") or "wake"
 WAKE_TIMEOUT = 3  # with two 3 s PR lookups this stays under GitHub's 10 s webhook timeout
+HERDR_TIMEOUT = 15
 PORT = int(os.environ.get("GH_WATCH_PORT", "8787"))
 DRY_RUN = os.environ.get("GH_WATCH_DRY_RUN") == "1"
 MAX_BODY = 1_000_000
@@ -35,6 +36,7 @@ MARK = "gh-watch-review:"
 os.environ["PATH"] = os.path.expanduser("~/.local/bin") + ":" + os.environ.get("PATH", "")
 SAFE = re.compile(r"[^A-Za-z0-9._/-]")
 DELIVERY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")  # no leading "-": it is passed as an argument
+BRANCH = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._/+@-]{0,254}")  # a routing key: passed exactly or not at all
 
 
 def safe(value, limit=60):
@@ -85,7 +87,7 @@ def herdr(*args):
         print("DRY-RUN herdr", *args, flush=True)
         return ""
     try:
-        done = subprocess.run([HERDR, *args], capture_output=True, text=True, timeout=15)
+        done = subprocess.run([HERDR, *args], capture_output=True, text=True, timeout=HERDR_TIMEOUT)
     except (OSError, subprocess.SubprocessError) as error:
         raise RuntimeError(f"herdr {args[0]} {args[1]}: {type(error).__name__}") from None
     if done.returncode:
@@ -192,9 +194,9 @@ def handle(event, payload, repos, delivery):
         hint = f"gh pr view {number} --comments"
     args = ["--source", "gh-watch", "--id", delivery, "--cwd", os.path.abspath(local), "--repo", safe(repo, 200),
             "--kind", kind, "--text", f"{message} in {safe(repo)}", "--hint", hint]
-    branch = safe(head, 100)
+    branch = str(head) if BRANCH.fullmatch(str(head)) else ""
     try:
-        status = enqueue(*args, *(["--branch", branch] if branch and not branch.startswith("-") else []))
+        status = enqueue(*args, *(["--branch", branch] if branch else []))
     except RuntimeError:
         threading.Thread(target=notify_user, args=(f"{title} (not queued for the agent)",), daemon=True).start()
         raise
