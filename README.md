@@ -73,7 +73,7 @@ GitHub does not retry a webhook delivery that failed, so events that happen whil
 
 Each result is shaped like its webhook and goes through the same path as a live delivery, with the same id, so herdr-wake drops what was already queued. A cursor per repo (`reconcile-<owner>_<repo>.json` in the state dir) holds GitHub's time of the last complete poll; each poll re-reads one hour before it. The cursor only moves when every enqueue succeeded, and the events request sends the ETag, so an unchanged feed costs no rate limit.
 
-- **First start**: the cursor is set to now and nothing older is replayed (so events queued by v0.3 under delivery ids are never queued again).
+- **First start**: the cursor is set to now and nothing older is ever replayed, not even by the one-hour overlap (so events queued by v0.3 under delivery ids are never queued again).
 - **`MAX_LOOKBACK` = 7 days**: a cursor older than that reads from 7 days ago and logs the gap it skipped. herdr-wake must keep ids for dedup longer than this.
 - **At most 20 new wakes per repo per poll**; the rest are logged and picked up by the next poll.
 - Results show in `receiver.log` as `reconcile owner/repo: ...`.

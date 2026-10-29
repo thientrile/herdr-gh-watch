@@ -266,9 +266,11 @@ FEED = {"PullRequestReviewEvent": "pull_request_review", "PullRequestReviewComme
 def from_feed(repo, entry):
     """A repo events feed entry as (time, event, webhook-shaped payload), or None when it is not reported or GitHub failed."""
     event, p = FEED.get(entry.get("type")), entry.get("payload") or {}
-    if not event or (event == "pull_request" and p.get("action") != "closed"):
+    if not event or (event == "pull_request" and p.get("action") not in ("closed", "merged")):
         return None
     payload = {**p, "repository": {"full_name": repo}, "sender": entry.get("actor") or {}}  # the ignore filter reads sender
+    if event == "pull_request":
+        payload["action"] = "closed"  # the feed may say "merged"; the webhook says "closed" with merged set
     if event == "pull_request_review" and p.get("action") == "created":
         payload["action"] = "submitted"  # the feed's word for the webhook's "submitted"
     if event == "pull_request":  # the feed trims pull_request: no merged flag
@@ -315,10 +317,11 @@ def reconcile(repo, repos):
     now = email.utils.parsedate_to_datetime(headers["date"])  # GitHub's clock, never ours
     etag = headers.get("etag") if status == 200 else state and state.get("etag")
     if not state:  # first start: nothing before now is replayed, so no flood and no event queued twice under an old id
-        save_cursor(path, {"cursor": iso(now)})
+        save_cursor(path, {"cursor": iso(now), "start": iso(now)})
         return f"first run, cursor set to {iso(now)}"
-    floor, cursor = iso(now - MAX_LOOKBACK), state["cursor"]
-    since = max(iso(datetime.strptime(cursor, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc) - OVERLAP), floor)
+    floor, cursor, start = iso(now - MAX_LOOKBACK), state["cursor"], state.get("start", "")
+    # never before the first start, even with the overlap: older events were queued by v0.3 under other ids
+    since = max(iso(datetime.strptime(cursor, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc) - OVERLAP), floor, start)
     note = f"; gap {cursor}..{floor} not read (MAX_LOOKBACK)" if cursor < floor else ""
     items, page = [], 1
     try:
@@ -350,11 +353,11 @@ def reconcile(repo, repos):
     except (RuntimeError, KeyError, TypeError, ValueError) as error:
         return f"{type(error).__name__}: {error}, cursor kept"
     items.sort(key=lambda item: item[0])
-    queued, done = 0, {"cursor": iso(now), "etag": etag}
+    queued, done = 0, {"cursor": iso(now), "etag": etag, "start": start}
     for index, (when, event, payload) in enumerate(items):
         if queued == RECONCILE_CAP:
             print(f"reconcile {name}: cap {RECONCILE_CAP} reached, {len(items) - index} left for the next poll from {when}", flush=True)
-            done = {"cursor": when}  # no ETag: the next poll must read the feed again
+            done = {"cursor": when, "start": start}  # no ETag: the next poll must read the feed again
             break
         try:
             result = handle(event, payload, repos)

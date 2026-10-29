@@ -178,7 +178,7 @@ def fake_get(path, etag=""):
 receiver.gh_get = fake_get
 before = len(wake_calls())
 assert receiver.reconcile("acme/app", receiver.load_repos()) == "first run, cursor set to 2026-10-29T16:00:00Z"
-assert json.load(open(cursor_file)) == {"cursor": "2026-10-29T16:00:00Z"} and len(wake_calls()) == before  # nothing old replayed
+assert json.load(open(cursor_file)) == {"cursor": "2026-10-29T16:00:00Z", "start": "2026-10-29T16:00:00Z"} and len(wake_calls()) == before  # nothing old replayed
 
 
 def feed_review(review_id, actor="someone", at="2026-10-29T16:30:00Z"):
@@ -196,9 +196,11 @@ def poll(feed, runs=(), etag='W/"e2"', status=200):
 
 
 open(os.path.join(checkout, "mode"), "w").write("ok")
-print(poll([feed_review(501)]))  # the review the live webhook queued above
-assert wake_calls()[-1][wake_calls()[-1].index("--id") + 1] == "review:501"  # same id as live: wake stores it once
-assert json.load(open(cursor_file)) == {"cursor": "2026-10-29T17:00:00Z", "etag": 'W/"e2"'}
+before = len(wake_calls())
+print(poll([feed_review(499, at="2026-10-29T15:30:00Z"), feed_review(501)]))  # 501: the review the live webhook queued above
+ids = [c[c.index("--id") + 1] for c in wake_calls()[before:]]
+assert ids == ["review:501"], ids  # same id as live, so wake stores it once; 499 predates the first start: the overlap stops there
+assert json.load(open(cursor_file)) == {"cursor": "2026-10-29T17:00:00Z", "etag": 'W/"e2"', "start": "2026-10-29T16:00:00Z"}
 
 open(os.path.join(receiver.CONFIG, "ignore_users"), "w").write("me\n")
 before = len(wake_calls())
@@ -222,6 +224,10 @@ routes["repos/acme/app/pulls/9"] = (200, {}, {"id": 4242, "number": 9, "merged":
 poll([{"type": "PullRequestEvent", "created_at": "2026-10-29T16:50:00Z", "actor": {"login": "x"},
        "payload": {"action": "closed", "number": 9, "pull_request": {"number": 9}}}])  # the feed has no merged flag
 assert wake_calls()[-1][wake_calls()[-1].index("--id") + 1] == "pr:4242:merged"
+routes["repos/acme/app/pulls/10"] = (200, {}, {"id": 4343, "number": 10, "merged": True, "head": {"ref": "feat/z"}})
+poll([{"type": "PullRequestEvent", "created_at": "2026-10-29T16:51:00Z", "actor": {"login": "x"},
+       "payload": {"action": "merged", "number": 10, "pull_request": {"number": 10}}}])  # the feed's other word for it
+assert wake_calls()[-1][wake_calls()[-1].index("--id") + 1] == "pr:4343:merged"
 
 # a trimmed comment (no id) switches comments to the comments endpoints
 routes["repos/acme/app/issues/comments"] = (200, {}, [
@@ -239,7 +245,7 @@ before = len(wake_calls())
 many = [feed_review(1000 + i, at=f"2026-10-29T16:{i:02d}:00Z") for i in range(25)]
 print(poll(many))
 assert len(wake_calls()) - before == 20
-assert json.load(open(cursor_file)) == {"cursor": "2026-10-29T16:20:00Z"}
+assert json.load(open(cursor_file)) == {"cursor": "2026-10-29T16:20:00Z", "start": "2026-10-29T16:00:00Z"}
 print(poll(many))  # the next poll queues the rest; the first 20 are duplicates
 assert len(wake_calls()) - before == 20 + 25
 
