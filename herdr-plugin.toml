@@ -1,6 +1,6 @@
 id = "thientrile.gh-watch"
 name = "GitHub Watch"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.9.1"
 description = "Receive GitHub webhooks (reviews, comments, CI runs, merges) and notify the herdr agent working in the matching checkout"
 platforms = ["linux"]
