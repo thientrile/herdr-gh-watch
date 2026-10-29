@@ -111,7 +111,7 @@ GitHub sends a `ping` first; a green check means the signature matched. Then add
 
 ```sh
 herdr plugin link "$PWD"
-python3 test_receiver.py     # describe(), the signature check and tunnel_cmd; no herdr needed
+python3 test_receiver.py     # describe(), the workflow_run PR lookup, the signature check, herdr failures and tunnel_cmd; no herdr needed
 HERDR_PLUGIN_CONFIG_DIR="$cfg" python3 receiver.py --review-once owner/repo 12   # print a review without posting it (add --post to post)
 ```
 
