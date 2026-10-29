@@ -51,8 +51,15 @@ assert post("/other", body, "pull_request_review")[0] == 404
 assert post("/github", body, "pull_request_review") == (200, "ignored")  # acme/app is not in repos.tsv
 
 # workflow_run with empty pull_requests (a PR from a fork): the PR is found by head_sha, else by owner:branch
+fake_gh = tempfile.mkdtemp()  # gh prints GitHub's JSON error body on stdout and exits 1
+open(os.path.join(fake_gh, "gh"), "w").write("#!/bin/sh\necho '{\"message\": \"Not Found\"}'\nexit 1\n")
+os.chmod(os.path.join(fake_gh, "gh"), 0o755)
+path, os.environ["PATH"] = os.environ["PATH"], fake_gh + ":" + os.environ["PATH"]
+assert receiver.gh_api("repos/acme/app/pulls") == []
+assert receiver.run_pr("acme/app", {"head_sha": "abc", "head_branch": "x", "head_repository": {"owner": {"login": "f"}}}) is None
+os.environ["PATH"] = path
 calls, answers = [], {}
-receiver.gh_api = lambda path: calls.append(path) or answers.get(path.split("/")[4] if "/commits/" in path else "pulls")
+receiver.gh_api = lambda path: calls.append(path) or answers.get(path.split("/")[4] if "/commits/" in path else "pulls") or []
 fork_run = {"head_sha": "abc123", "head_branch": "fix x", "head_repository": {"owner": {"login": "forker"}},
             "conclusion": "failure", "pull_requests": []}
 answers["abc123"] = [{"number": 4, "state": "closed", "head": {"ref": "fix x"}},
@@ -61,8 +68,11 @@ assert receiver.run_pr("acme/app", fork_run) == 5 and calls == ["repos/acme/app/
 answers["abc123"], answers["pulls"], calls[:] = [], [{"number": 6}], []
 assert receiver.run_pr("acme/app", fork_run) == 6
 assert calls[1] == "repos/acme/app/pulls?head=forker%3Afix+x&state=open", calls
-answers["pulls"] = None  # gh failed or found nothing: the branch-run message as before
+answers["pulls"] = []  # gh failed or found nothing: the branch-run message as before
 assert receiver.run_pr("acme/app", fork_run) is None
+long_repo = "o/" + "n" * 90  # the full name goes into the API path, not the 60-char display form
+receiver.run_pr(long_repo, fork_run)
+assert calls[-2] == f"repos/{long_repo}/commits/abc123/pulls", calls[-2]
 
 checkout = tempfile.mkdtemp()
 open(os.path.join(receiver.CONFIG, "repos.tsv"), "w").write(f"acme/app\t{checkout}\n")
@@ -101,6 +111,13 @@ assert review_on(9, "slow")[0] == 502
 receiver.HERDR = os.path.join(checkout, "no-such-herdr")
 assert review_on(10, "ok")[0] == 502
 server.shutdown()
+
+receiver.STATE = tempfile.mkdtemp()  # concurrent requests claim the one review round once
+claims = []
+workers = [threading.Thread(target=lambda: claims.append(receiver.claim_review("acme/app", 1))) for _ in range(8)]
+[w.start() for w in workers]
+[w.join() for w in workers]
+assert sorted(claims) == [False] * 7 + [True], claims
 
 assert receiver.start_tunnel() is None  # no tunnel_cmd: nothing is started
 tunnel_cmd = os.path.join(receiver.CONFIG, "tunnel_cmd")

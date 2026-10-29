@@ -104,11 +104,13 @@ def herdr(*args):
 
 
 def gh_api(path):
-    """Parsed JSON of a read-only `gh api` call, or None."""
+    """The objects of a read-only `gh api` call that returns a list, or [] (gh prints error bodies too, exiting nonzero)."""
     try:
-        return json.loads(subprocess.run(["gh", "api", path], capture_output=True, text=True, timeout=10).stdout)
+        done = subprocess.run(["gh", "api", path], capture_output=True, text=True, timeout=10)
+        data = json.loads(done.stdout) if done.returncode == 0 else []
     except (OSError, subprocess.SubprocessError, ValueError):
-        return None
+        return []
+    return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
 
 
 def run_pr(repo, run):
@@ -117,12 +119,12 @@ def run_pr(repo, run):
     owner = safe(((run.get("head_repository") or {}).get("owner") or {}).get("login", ""))
     if not sha or not branch:
         return None
-    for pr in gh_api(f"repos/{safe(repo)}/commits/{sha}/pulls") or []:
+    for pr in gh_api(f"repos/{safe(repo, 200)}/commits/{sha}/pulls"):
         if pr.get("state") == "open" and (pr.get("head") or {}).get("ref") == branch and isinstance(pr.get("number"), int):
             return pr["number"]
     if owner:
         query = urllib.parse.urlencode({"head": f"{owner}:{branch}", "state": "open"})
-        for pr in gh_api(f"repos/{safe(repo)}/pulls?{query}") or []:
+        for pr in gh_api(f"repos/{safe(repo, 200)}/pulls?{query}"):
             if isinstance(pr.get("number"), int):
                 return pr["number"]
     return None
@@ -274,8 +276,16 @@ def review_repos():
         return set()
 
 
+CLAIMS = threading.Lock()  # requests run in threads: the read-check-write below must not interleave
+
+
 def claim_review(repo, number):
     """One round per PR: True only the first time (kept on disk, so a restart does not review twice)."""
+    with CLAIMS:
+        return claim_review_locked(repo, number)
+
+
+def claim_review_locked(repo, number):
     os.makedirs(STATE, exist_ok=True)
     path = os.path.join(STATE, "reviews.json")
     try:
