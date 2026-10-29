@@ -63,8 +63,14 @@ receiver.gh_api = lambda path: calls.append(path) or answers.get(path.split("/")
 fork_run = {"head_sha": "abc123", "head_branch": "fix x", "head_repository": {"owner": {"login": "forker"}},
             "conclusion": "failure", "pull_requests": []}
 answers["abc123"] = [{"number": 4, "state": "closed", "head": {"ref": "fix x"}},
-                     {"number": 5, "state": "open", "head": {"ref": "fix x"}}]
+                     {"number": 5, "state": "open", "head": {"ref": "fix x", "repo": {"owner": {"login": "forker"}}}}]
 assert receiver.run_pr("acme/app", fork_run) == 5 and calls == ["repos/acme/app/commits/abc123/pulls"]
+answers["abc123"] = [
+    {"number": 11, "state": "open", "head": {"ref": "fix x", "repo": {"owner": {"login": "other"}}}},
+    {"number": 12, "state": "open", "head": {"ref": "fix x", "repo": {"owner": {"login": "forker"}}}},
+]
+assert receiver.run_pr("acme/app", fork_run) == 12
+
 answers["abc123"], answers["pulls"], calls[:] = [], [{"number": 6}], []
 assert receiver.run_pr("acme/app", fork_run) == 6
 assert calls[1] == "repos/acme/app/pulls?head=forker%3Afix+x&state=open", calls
@@ -78,14 +84,16 @@ checkout = tempfile.mkdtemp()
 open(os.path.join(receiver.CONFIG, "repos.tsv"), "w").write(f"acme/app\t{checkout}\n")
 delivered, deliver = [], receiver.deliver
 receiver.deliver = lambda *args: delivered.append(args) or "done"
-answers["abc123"] = [{"number": 5, "state": "open", "head": {"ref": "fix x"}}]
+answers["abc123"] = [{"number": 5, "state": "open", "head": {"ref": "fix x", "repo": {"owner": {"login": "forker"}}}}]
 fork_event = {"action": "completed", "repository": repo, "workflow_run": fork_run}
-assert post("/github", json.dumps(fork_event).encode(), "workflow_run") == (200, "accepted, looking up the PR")
-for _ in range(50):  # the lookup runs off the request path
-    if delivered:
-        break
-    time.sleep(0.1)
+assert post("/github", json.dumps(fork_event).encode(), "workflow_run") == (200, "done")
 assert delivered and delivered[0][4:] == ("CI finished (failure) for PR #5", 5), delivered
+def fail_delivery(*args):
+    raise RuntimeError("handoff failed")
+
+
+receiver.deliver = fail_delivery
+assert post("/github", json.dumps(fork_event).encode(), "workflow_run")[0] == 502
 receiver.deliver = deliver
 
 # herdr failures: a failed, timed-out or missing herdr never counts as "notified" and answers 502

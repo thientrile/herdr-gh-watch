@@ -106,7 +106,7 @@ def herdr(*args):
 def gh_api(path):
     """The objects of a read-only `gh api` call that returns a list, or [] (gh prints error bodies too, exiting nonzero)."""
     try:
-        done = subprocess.run(["gh", "api", path], capture_output=True, text=True, timeout=10)
+        done = subprocess.run(["gh", "api", path], capture_output=True, text=True, timeout=3)
         data = json.loads(done.stdout) if done.returncode == 0 else []
     except (OSError, subprocess.SubprocessError, ValueError):
         return []
@@ -120,7 +120,8 @@ def run_pr(repo, run):
     if not sha or not branch:
         return None
     for pr in gh_api(f"repos/{safe(repo, 200)}/commits/{sha}/pulls"):
-        if pr.get("state") == "open" and (pr.get("head") or {}).get("ref") == branch and isinstance(pr.get("number"), int):
+        if pr.get("state") == "open" and (pr.get("head") or {}).get("ref") == branch and isinstance(pr.get("number"), int) \
+                and (not owner or (((pr.get("head") or {}).get("repo") or {}).get("owner") or {}).get("login") == owner):
             return pr["number"]
     if owner:
         query = urllib.parse.urlencode({"head": f"{owner}:{branch}", "state": "open"})
@@ -199,21 +200,11 @@ def handle(event, payload, repos):
     title, message, number = summary
     run = payload.get("workflow_run") or {}
     if event == "workflow_run" and number is None and run.get("head_sha"):
-        def finish():  # the PR lookup calls GitHub and can be slow, so it runs off the request path
-            found = run_pr(repo, run)
-            result = handle(event, {**payload, "workflow_run": {**run, "pull_requests": [{"number": found}]}}, repos) \
-                if found else deliver(event, payload, local, title, message, None)
-            print(f"{event} (PR lookup): {result}", flush=True)
-        threading.Thread(target=lambda: log_errors(event, finish), daemon=True).start()
-        return "accepted, looking up the PR"
+        found = run_pr(repo, run)
+        if found:
+            payload = {**payload, "workflow_run": {**run, "pull_requests": [{"number": found}]}}
+            title, message, number = describe(event, payload)
     return deliver(event, payload, local, title, message, number)
-
-
-def log_errors(event, work):
-    try:
-        work()
-    except Exception as error:
-        print(f"error handling {event}: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
 
 
 def deliver(event, payload, local, title, message, number):
