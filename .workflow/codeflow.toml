@@ -1,0 +1,16 @@
+[verification]
+
+[[verification.checks]]
+name = "tests"
+command = "python3 test_receiver.py"
+timeout_seconds = 120
+
+[[verification.checks]]
+name = "python-syntax"
+command = "python3 -m compileall -q ."
+timeout_seconds = 60
+
+[[verification.checks]]
+name = "shell-syntax"
+command = "bash -n start.sh"
+timeout_seconds = 30
