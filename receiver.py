@@ -5,8 +5,10 @@ the matching checkout with `wake enqueue` (the herdr-wake plugin delivers it)
 when a review, a comment, a finished CI run or a merge happened. Only fixed text
 built from enum fields and sanitized identifiers is ever queued: PR titles,
 comments and branch names from the payload are attacker-controlled data and
-never reach a prompt.
+never reach a prompt. A thread polls GitHub for events missed while the receiver
+was unreachable and passes them through the same path (reconcile()).
 """
+import email.utils
 import hashlib
 import hmac
 import json
@@ -20,7 +22,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.parse
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 
 CONFIG = os.environ.get("HERDR_PLUGIN_CONFIG_DIR") or os.path.expanduser("~/.config/herdr-gh-watch")
@@ -35,8 +39,12 @@ STATE = os.environ.get("HERDR_PLUGIN_STATE_DIR") or os.path.expanduser("~/.local
 MARK = "gh-watch-review:"
 os.environ["PATH"] = os.path.expanduser("~/.local/bin") + ":" + os.environ.get("PATH", "")
 SAFE = re.compile(r"[^A-Za-z0-9._/-]")
-DELIVERY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")  # no leading "-": it is passed as an argument
+DELIVERY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")  # only logged now: the enqueue id comes from the event
 BRANCH = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._/+@-]{0,254}")  # a routing key: passed exactly or not at all
+RECONCILE_EVERY = 600
+OVERLAP = timedelta(hours=1)  # each poll re-reads this much before the cursor; herdr-wake dedups the repeats
+MAX_LOOKBACK = timedelta(days=7)  # herdr-wake keeps ids longer than this, so a re-read never wakes twice
+RECONCILE_CAP = 20  # new wakes per repo per poll
 
 
 def safe(value, limit=60):
@@ -166,7 +174,19 @@ def describe(event, payload):
     return None
 
 
-def handle(event, payload, repos, delivery):
+def event_id(event, payload):
+    """The enqueue id: the same for a live webhook and its reconciled copy, so herdr-wake stores the event once."""
+    if event == "pull_request_review":
+        return f"review:{int(payload['review']['id'])}"
+    if event in ("issue_comment", "pull_request_review_comment"):
+        return f"comment:{int(payload['comment']['id'])}"
+    if event == "workflow_run":
+        run = payload["workflow_run"]
+        return f"run:{int(run['id'])}:{int(run.get('run_attempt') or 1)}"
+    return f"pr:{int(payload['pull_request']['id'])}:merged"
+
+
+def handle(event, payload, repos):
     repo = payload.get("repository", {}).get("full_name", "")
     local = repos.get(repo)
     run = payload.get("workflow_run") or {}
@@ -192,7 +212,7 @@ def handle(event, payload, repos, delivery):
     else:
         kind = {"pull_request_review": "review", "pull_request": "merged"}.get(event, "comment")
         hint = f"gh pr view {number} --comments"
-    args = ["--source", "gh-watch", "--id", delivery, "--cwd", os.path.abspath(local), "--repo", safe(repo, 200),
+    args = ["--source", "gh-watch", "--id", event_id(event, payload), "--cwd", os.path.abspath(local), "--repo", safe(repo, 200),
             "--kind", kind, "--text", f"{message} in {safe(repo)}", "--hint", hint]
     branch = str(head) if BRANCH.fullmatch(str(head)) else ""
     try:
@@ -200,7 +220,7 @@ def handle(event, payload, repos, delivery):
     except RuntimeError:
         threading.Thread(target=notify_user, args=(f"{title} (not queued for the agent)",), daemon=True).start()
         raise
-    if status != "duplicate":  # a redelivery was already announced
+    if status != "duplicate":  # a redelivery or a reconciled copy was already announced
         threading.Thread(target=notify_user, args=(title,), daemon=True).start()
     return f"wake {status}"
 
@@ -216,6 +236,154 @@ def notify_user(title):
             subprocess.run([*notify, f"GitHub: {title}"], capture_output=True, timeout=15)
         except (OSError, subprocess.SubprocessError):
             pass
+
+
+def gh_get(path, etag=""):
+    """(HTTP status, lowercased headers, JSON body) of a read-only `gh api -i` call; status 0 when gh could not run."""
+    try:
+        done = subprocess.run(["gh", "api", "-i", path, *(["-H", f"If-None-Match: {etag}"] if etag else [])],
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return 0, {}, None
+    head, _, body = done.stdout.replace("\r\n", "\n").partition("\n\n")
+    status, *lines = head.split("\n")
+    code = re.match(r"HTTP/\S+ (\d{3})", status)
+    try:
+        data = json.loads(body) if body.strip() else None
+    except ValueError:
+        data = None
+    return int(code.group(1)) if code else 0, {k.strip().lower(): v.strip() for k, _, v in (l.partition(":") for l in lines)}, data
+
+
+def iso(moment):
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")  # GitHub's own format, so timestamps compare as strings
+
+
+FEED = {"PullRequestReviewEvent": "pull_request_review", "PullRequestReviewCommentEvent": "pull_request_review_comment",
+        "IssueCommentEvent": "issue_comment", "PullRequestEvent": "pull_request"}
+
+
+def from_feed(repo, entry):
+    """A repo events feed entry as (time, event, webhook-shaped payload), or None when it is not reported or GitHub failed."""
+    event, p = FEED.get(entry.get("type")), entry.get("payload") or {}
+    if not event or (event == "pull_request" and p.get("action") != "closed"):
+        return None
+    payload = {**p, "repository": {"full_name": repo}, "sender": entry.get("actor") or {}}  # the ignore filter reads sender
+    if event == "pull_request_review" and p.get("action") == "created":
+        payload["action"] = "submitted"  # the feed's word for the webhook's "submitted"
+    if event == "pull_request":  # the feed trims pull_request: no merged flag
+        status, _, pr = gh_get(f"repos/{repo}/pulls/{int(p['pull_request']['number'])}")
+        if status != 200 or not isinstance(pr, dict):
+            raise RuntimeError(f"pulls/{p['pull_request']['number']}: HTTP {status}")
+        payload["pull_request"] = pr
+    return str(entry.get("created_at", "")), event, payload
+
+
+def comments_since(repo, since):
+    """PR comments from the comments endpoints, for a feed whose comment payloads are trimmed."""
+    items = []
+    for event, kind in (("issue_comment", "issues"), ("pull_request_review_comment", "pulls")):
+        comments, page = [], 0
+        while page < 10 and len(comments) == page * 100:  # since= matches edits too, so a window can hold many
+            page += 1
+            status, _, more = gh_get(f"repos/{repo}/{kind}/comments?since={since}&per_page=100&page={page}")
+            if status != 200 or not isinstance(more, list):
+                raise RuntimeError(f"{kind}/comments: HTTP {status}")
+            comments += [c for c in more if isinstance(c, dict)]
+        for comment in comments:
+            pr = re.search(r"/pull/(\d+)", str(comment.get("html_url", "")))  # an issue's comment has /issues/ here
+            if not pr or str(comment.get("created_at", "")) < since:
+                continue
+            payload = {"action": "created", "repository": {"full_name": repo}, "comment": comment, "sender": comment.get("user") or {}}
+            payload.update({"issue": {"number": int(pr.group(1)), "pull_request": {"html_url": comment["html_url"]}}}
+                           if event == "issue_comment" else {"pull_request": {"number": int(pr.group(1))}})
+            items.append((str(comment["created_at"]), event, payload))
+    return items
+
+
+def reconcile(repo, repos):
+    """Hands the reportable events since this repo's cursor to handle(), as if their webhooks had arrived; a log line."""
+    name = safe(repo, 200)
+    path = os.path.join(STATE, f"reconcile-{name.replace('/', '_')}.json")  # owners have no "_": names cannot collide
+    try:
+        state = json.load(open(path))
+    except (OSError, ValueError):
+        state = None
+    status, headers, feed = gh_get(f"repos/{name}/events?per_page=100", (state or {}).get("etag", ""))
+    if status not in (200, 304) or "date" not in headers:
+        return f"events: HTTP {status}, cursor kept"
+    now = email.utils.parsedate_to_datetime(headers["date"])  # GitHub's clock, never ours
+    etag = headers.get("etag") if status == 200 else state and state.get("etag")
+    if not state:  # first start: nothing before now is replayed, so no flood and no event queued twice under an old id
+        save_cursor(path, {"cursor": iso(now)})
+        return f"first run, cursor set to {iso(now)}"
+    floor, cursor = iso(now - MAX_LOOKBACK), state["cursor"]
+    since = max(iso(datetime.strptime(cursor, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc) - OVERLAP), floor)
+    note = f"; gap {cursor}..{floor} not read (MAX_LOOKBACK)" if cursor < floor else ""
+    items, page = [], 1
+    try:
+        while status == 200 and isinstance(feed, list):  # 304: the feed has not changed since the last complete poll
+            entries = [e for e in feed if isinstance(e, dict) and str(e.get("created_at", "")) >= since]
+            items += [item for item in map(lambda e: from_feed(name, e), entries) if item]
+            if not entries or len(feed) < 100 or page == 3:  # not sorted strictly by time; it holds 300 events
+                break
+            page += 1
+            status, _, feed = gh_get(f"repos/{name}/events?per_page=100&page={page}")
+            if status != 200:
+                raise RuntimeError(f"events page {page}: HTTP {status}")
+        if any(e in ("issue_comment", "pull_request_review_comment") and not (p.get("comment") or {}).get("id") for _, e, p in items):
+            items = [i for i in items if i[1] not in ("issue_comment", "pull_request_review_comment")] + comments_since(name, since)
+        query = urllib.parse.urlencode({"status": "completed", "per_page": 100, "created": f">={since}"})
+        status, _, runs = gh_get(f"repos/{name}/actions/runs?{query}")
+        if status != 200 or not isinstance(runs, dict):
+            raise RuntimeError(f"actions/runs: HTTP {status}")
+        if isinstance(runs.get("total_count"), int) and runs["total_count"] > 100:  # shortcut: one page, newest first
+            note += f"; {runs['total_count'] - 100} older CI runs not read"
+        runs = [r for r in runs.get("workflow_runs") or [] if isinstance(r, dict)]
+        if runs:  # handle() needs the default branch to skip the PR lookup for push runs
+            status, _, info = gh_get(f"repos/{name}")
+            if status != 200 or not isinstance(info, dict):
+                raise RuntimeError(f"repo: HTTP {status}")
+            repository = {"full_name": name, "default_branch": info.get("default_branch")}
+            items += [(str(r.get("created_at", "")), "workflow_run", {"action": "completed", "repository": repository, "workflow_run": r})
+                      for r in runs]
+    except (RuntimeError, KeyError, TypeError, ValueError) as error:
+        return f"{type(error).__name__}: {error}, cursor kept"
+    items.sort(key=lambda item: item[0])
+    queued, done = 0, {"cursor": iso(now), "etag": etag}
+    for index, (when, event, payload) in enumerate(items):
+        if queued == RECONCILE_CAP:
+            print(f"reconcile {name}: cap {RECONCILE_CAP} reached, {len(items) - index} left for the next poll from {when}", flush=True)
+            done = {"cursor": when}  # no ETag: the next poll must read the feed again
+            break
+        try:
+            result = handle(event, payload, repos)
+        except RuntimeError as error:
+            return f"{error}, cursor kept"
+        except (KeyError, TypeError, ValueError) as error:
+            print(f"reconcile {name}: skipped a malformed {event}: {type(error).__name__}", flush=True)
+            continue
+        queued += result == "wake enqueued"  # duplicates and dry runs wake nobody
+    save_cursor(path, done)
+    return f"{queued} queued from {len(items)} events since {since}{note}"
+
+
+def save_cursor(path, state):
+    os.makedirs(STATE, exist_ok=True)
+    with open(path + ".tmp", "w") as out:
+        json.dump(state, out)
+    os.replace(path + ".tmp", path)
+
+
+def reconcile_loop():
+    while True:
+        repos = load_repos()
+        for repo in repos:
+            try:
+                print(f"reconcile {repo}: {reconcile(repo, repos)}", flush=True)
+            except Exception as error:  # one bad poll must not end the thread
+                print(f"reconcile {repo}: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
+        time.sleep(RECONCILE_EVERY)
 
 
 REVIEW_PROMPT = """You have NO tools, NO shell and NO repository access in this session. Do not try to run commands or read files: everything you need is in the diff below. Answer directly in text.
@@ -330,16 +498,16 @@ class Hook(BaseHTTPRequestHandler):
         if event == "ping":
             return self.reply(200, "pong")
         delivery = self.headers.get("X-GitHub-Delivery", "")
-        if not DELIVERY.fullmatch(delivery):  # the dedup key: without it a redelivery could not be told apart
+        if not DELIVERY.fullmatch(delivery):  # GitHub always sends it: a request without one is not a real delivery
             return self.reply(400)
         try:
             data = json.loads(body)
             maybe_review(event, data)
-            result = handle(event, data, load_repos(), delivery)
+            result = handle(event, data, load_repos())
         except Exception as error:
-            print(f"error handling {event}: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
+            print(f"error handling {event} {delivery}: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
             return self.reply(502 if isinstance(error, RuntimeError) else 500)
-        print(f"{event}: {result}", flush=True)
+        print(f"{event} {delivery}: {result}", flush=True)
         self.reply(200, result)
 
     def log_message(self, *_):
@@ -355,6 +523,7 @@ if __name__ == "__main__":
     # shortcut: the tunnel stops with a normal stop (SIGTERM, as start.sh --restart sends); a SIGKILL leaves it running
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     tunnel = start_tunnel()
+    threading.Thread(target=reconcile_loop, daemon=True).start()
     try:
         server.serve_forever()
     finally:

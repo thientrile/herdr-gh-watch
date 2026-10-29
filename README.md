@@ -16,7 +16,7 @@ Each event shows a herdr notification and is handed to the [herdr-wake](https://
 - [gh-watch] CI finished (failure) for PR #7 in acme/app — check: gh pr checks 7
 ```
 
-The agent then reads the PR itself with `gh`. A redelivery of the same event (same `X-GitHub-Delivery`) is queued once. gh-watch never prompts an agent itself: queueing, routing, retries and delivery are herdr-wake's job.
+The agent then reads the PR itself with `gh`. Each event is queued under an id taken from the event itself (`review:<id>`, `comment:<id>`, `run:<id>:<attempt>`, `pr:<id>:merged`), so a redelivery, or the same event found again by [reconcile](#missed-webhooks-reconcile), is queued once. gh-watch never prompts an agent itself: queueing, routing, retries and delivery are herdr-wake's job.
 
 ## Install
 
@@ -58,11 +58,27 @@ Lines starting with `#` are comments. The port is `GH_WATCH_PORT` (default 8787)
 | --- | --- |
 | 200 `wake enqueued` / `wake duplicate` | Stored by herdr-wake (or already stored). |
 | 200 `ignored...` | Not a listed repo, not an event worth reporting, or your own comment. |
-| 400 | No `X-GitHub-Delivery` header, so no id to deduplicate by. Nothing queued. |
+| 400 | No `X-GitHub-Delivery` header: not a real GitHub delivery. Nothing queued. |
 | 401 / 404 | Bad signature / wrong path. |
 | 502 | `wake enqueue` failed, timed out or is not installed, so the event may not be stored (you still get the notification, marked "not queued"). Redeliver it from the webhook's Recent Deliveries once fixed; if it was stored after all, wake answers `duplicate`. |
 
 For a `workflow_run` whose `pull_requests` is empty (a PR from a fork), the receiver looks the PR up with `gh api` (by head commit, then by `owner:branch`) before queueing.
+
+## Missed webhooks (reconcile)
+
+GitHub does not retry a webhook delivery that failed, so events that happen while the receiver is unreachable (laptop asleep, WSL off, tunnel down) would be lost. The receiver therefore also polls GitHub, read-only through your `gh` login, at start and every 10 minutes, for each repo in `repos.tsv`:
+
+- `GET /repos/{owner}/{repo}/events` for reviews, PR comments, inline comments and merges (the feed's `actor` becomes the webhook's `sender`, so `ignore_users` still applies). The feed trims PR objects, so a closed PR is looked up once to see whether it was merged; if comment payloads come back trimmed too, comments are read from `/issues/comments` and `/pulls/comments` instead.
+- `GET /repos/{owner}/{repo}/actions/runs?status=completed&created>=...` for CI.
+
+Each result is shaped like its webhook and goes through the same path as a live delivery, with the same id, so herdr-wake drops what was already queued. A cursor per repo (`reconcile-<owner>_<repo>.json` in the state dir) holds GitHub's time of the last complete poll; each poll re-reads one hour before it. The cursor only moves when every enqueue succeeded, and the events request sends the ETag, so an unchanged feed costs no rate limit.
+
+- **First start**: the cursor is set to now and nothing older is replayed (so events queued by v0.3 under delivery ids are never queued again).
+- **`MAX_LOOKBACK` = 7 days**: a cursor older than that reads from 7 days ago and logs the gap it skipped. herdr-wake must keep ids for dedup longer than this.
+- **At most 20 new wakes per repo per poll**; the rest are logged and picked up by the next poll.
+- Results show in `receiver.log` as `reconcile owner/repo: ...`.
+
+Limits: the events feed lags behind real time by about 30 seconds to 6 hours and holds only the last 300 events, so an event that shows up in the feed more than an hour after it happened, or that falls out of a busy feed, is missed. Only the newest 100 CI runs per poll are read (the log says how many older ones were skipped). CI runs are matched by when they were created, so a re-run of an old run, or a run that finishes long after it started, can be missed. For anything missed, open the webhook's Recent Deliveries in the repo settings and press **Redeliver**.
 
 ## Expose the receiver
 
@@ -126,7 +142,7 @@ GitHub sends a `ping` first; a green check means the signature matched. Then add
 
 ```sh
 herdr plugin link "$PWD"
-python3 test_receiver.py     # describe(), the workflow_run PR lookup, the webhook checks, `wake enqueue` and tunnel_cmd; no herdr or wake needed
+python3 test_receiver.py     # describe(), the workflow_run PR lookup, the webhook checks, `wake enqueue`, reconcile and tunnel_cmd; no herdr, wake or network needed
 HERDR_PLUGIN_CONFIG_DIR="$cfg" python3 receiver.py --review-once owner/repo 12   # print a review without posting it (add --post to post)
 ```
 
