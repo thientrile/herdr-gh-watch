@@ -64,6 +64,8 @@ With a third column, the coordinator dir (e.g. a herdr-projects project folder s
 | --- | --- |
 | `merged`, `auto_merge`, `behind`, approved reviews, `ci_success`, `codex_clean`, `codex_slow` | other CI results (`ci_failure`, ...), comments, other reviews, `codex_findings` |
 
+A run that ends `cancelled` after one of its jobs failed or timed out is queued as `ci_failure` naming the failed jobs (`CI failed (coverage) for PR #542`), so it is not read as a superseded run; when no job failed, or the jobs cannot be read, it stays `ci_cancelled`.
+
 Each event is queued once, to one place. herdr-wake then picks the pane whose cwd is exactly the coordinator dir. When no agent runs there, its fallback order applies: first a pane whose cwd is **below** the coordinator dir (for example a thread working in `<coordinator dir>/threads/...`), the deepest one first; then an agent in any checkout or worktree of the repo (matched by its `origin` remote, since a project folder is not a git repo). So with the coordinator pane closed, a thread inside the project folder gets the coordinator's events. Keep the coordinator pane open, or leave the third column out.
 
 ## Codex

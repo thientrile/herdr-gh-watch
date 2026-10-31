@@ -58,9 +58,12 @@ os.chmod(os.path.join(fake_gh, "gh"), 0o755)
 path, os.environ["PATH"] = os.environ["PATH"], fake_gh + ":" + os.environ["PATH"]
 assert receiver.gh_api("repos/acme/app/pulls") == []
 assert receiver.run_pr("acme/app", {"head_sha": "abc", "head_branch": "x", "head_repository": {"owner": {"login": "f"}}}) is None
+assert receiver.gh_api("repos/acme/app/actions/runs/1/attempts/1/jobs", "jobs") == []  # the jobs call failed
+open(os.path.join(fake_gh, "gh"), "w").write("#!/bin/sh\necho '{\"jobs\": [{\"name\": \"coverage\"}, 3]}'\n")
+assert receiver.gh_api("repos/acme/app/actions/runs/1/attempts/1/jobs", "jobs") == [{"name": "coverage"}]  # the list under the key
 os.environ["PATH"] = path
-calls, answers = [], {}
-receiver.gh_api = lambda path: calls.append(path) or answers.get(path.split("/")[4] if "/commits/" in path else "pulls") or []
+calls, answers, jobs = [], {}, []
+receiver.gh_api = lambda path, key="": calls.append(path) or (jobs if key else answers.get(path.split("/")[4] if "/commits/" in path else "pulls")) or []
 fork_run = {"id": 801, "run_attempt": 1, "head_sha": "abc123", "head_branch": "fix x", "head_repository": {"owner": {"login": "forker"}},
             "conclusion": "failure", "pull_requests": []}
 answers["abc123"] = [{"number": 4, "state": "closed", "head": {"ref": "fix x"}},
@@ -148,6 +151,36 @@ calls[:] = []  # a push run on the default branch has no PR: no lookup on the re
 main_run = {**fork_run, "id": 802, "head_branch": "main", "head_repository": {"full_name": "acme/app"}}
 assert send("workflow_run", {**fork_event, "repository": {**repo, "default_branch": "main"}, "workflow_run": main_run}, "g-8") \
     == (200, "wake enqueued") and calls == []
+
+# a run cancelled after a job failed is a failure naming the failed jobs; the run's id stays the event id
+cancelled = {**fork_event, "workflow_run": {**fork_run, "id": 803, "run_attempt": 2, "conclusion": "cancelled", "pull_requests": [{"number": 542}]}}
+jobs[:], calls[:] = [{"name": "coverage", "conclusion": "failure"}, {"name": "e2e", "conclusion": "cancelled"}], []
+assert send("workflow_run", cancelled, "g-c1") == (200, "wake enqueued")
+call = wake_calls()[-1]
+assert calls == ["repos/acme/app/actions/runs/803/attempts/2/jobs?per_page=100"], calls
+assert (call[call.index("--kind") + 1], call[call.index("--id") + 1]) == ("ci_failure", "run:803:2"), call
+assert call[call.index("--text") + 1] == "CI failed (coverage) for PR #542 in acme/app", call
+jobs[:] = [{"name": f"t {i}; $(id)", "conclusion": "timed_out" if i % 2 else "failure"} for i in range(5)]
+cancelled["workflow_run"]["id"] = 804
+assert send("workflow_run", cancelled, "g-c2") == (200, "wake enqueued")
+assert wake_calls()[-1][wake_calls()[-1].index("--text") + 1] == "CI failed (t0id, t1id, t2id +2) for PR #542 in acme/app"
+jobs[:] = [{"name": "e2e", "conclusion": "cancelled"}, {"name": "lint", "conclusion": "success"}]
+cancelled["workflow_run"]["id"] = 805
+assert send("workflow_run", cancelled, "g-c3") == (200, "wake enqueued")  # superseded, nothing failed: cancelled as before
+call = wake_calls()[-1]
+assert call[call.index("--kind") + 1] == "ci_cancelled" and call[call.index("--text") + 1] == "CI finished (cancelled) for PR #542 in acme/app"
+jobs[:], cancelled["workflow_run"]["id"] = [], 806  # the jobs call failed: the event is still queued, as cancelled
+assert send("workflow_run", cancelled, "g-c4") == (200, "wake enqueued") and wake_calls()[-1][wake_calls()[-1].index("--kind") + 1] == "ci_cancelled"
+jobs[:], cancelled["workflow_run"]["id"] = [{"name": "", "conclusion": "failure"}, {"name": "日本", "conclusion": "failure"}], 807
+assert send("workflow_run", cancelled, "g-c5") == (200, "wake enqueued")  # failed, but no name survives safe()
+call = wake_calls()[-1]
+assert call[call.index("--kind") + 1] == "ci_failure" and call[call.index("--text") + 1] == "CI finished (failure) for PR #542 in acme/app", call
+jobs[:], calls[:] = [{"name": "coverage", "conclusion": "failure"}], []  # only a cancelled run reads its jobs
+for i, conclusion in enumerate(("success", "failure", "timed_out")):
+    assert send("workflow_run", {**cancelled, "workflow_run": {**cancelled["workflow_run"], "id": 810 + i, "conclusion": conclusion}}, f"g-c{6 + i}")[0] == 200
+    call = wake_calls()[-1]
+    assert call[call.index("--kind") + 1] == f"ci_{conclusion}" and call[call.index("--text") + 1] == f"CI finished ({conclusion}) for PR #542 in acme/app"
+assert calls == []
 assert send("pull_request_review", {**attack, "pull_request": {"number": 7, "head": {"ref": "-x"}}}, "g-9")[0] == 200
 assert "--branch" not in wake_calls()[-1]  # a value starting with "-" would be read as an option
 assert send("pull_request_review", {**attack, "pull_request": {"number": 7, "head": {"ref": "feature/c++"}}}, "g-10")[0] == 200
@@ -219,6 +252,11 @@ poll([], runs=[{**run_base, "run_attempt": 1}, {**run_base, "run_attempt": 2}])
 ids = [c[c.index("--id") + 1] for c in wake_calls()[-2:]]
 assert ids == ["run:900:1", "run:900:2"], ids  # a re-run is a new event
 assert [g for g in gets if g[0].startswith("repos/acme/app/actions/runs")][0][0].endswith("created=%3E%3D2026-10-29T16%3A00%3A00Z")
+jobs[:] = [{"name": "coverage", "conclusion": "failure"}]  # the reconciled copy of the webhook's cancelled run: same id, stored once
+before = len(wake_calls())
+assert poll([], runs=[{**cancelled["workflow_run"], "id": 803, "created_at": "2026-10-29T16:41:00Z"}]).startswith("0 queued")
+call = wake_calls()[-1]
+assert len(wake_calls()) == before + 1 and call[call.index("--id") + 1] == "run:803:2" and call[call.index("--kind") + 1] == "ci_failure", call
 
 routes["repos/acme/app/pulls/9"] = (200, {}, {"id": 4242, "number": 9, "merged": True, "head": {"ref": "feat/y"}})
 poll([{"type": "PullRequestEvent", "created_at": "2026-10-29T16:50:00Z", "actor": {"login": "x"},
