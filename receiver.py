@@ -129,13 +129,14 @@ def enqueue(*args):
         return "enqueued"
 
 
-def gh_api(path):
-    """The objects of a read-only `gh api` call that returns a list, or [] (gh prints error bodies too, exiting nonzero)."""
+def gh_api(path, key=""):
+    """The objects of a read-only `gh api` call that returns a list (or an object holding it under key), or [] (gh prints error bodies too, exiting nonzero)."""
     try:
         done = subprocess.run(["gh", "api", path], capture_output=True, text=True, timeout=3)
         data = json.loads(done.stdout) if done.returncode == 0 else []
     except (OSError, subprocess.SubprocessError, ValueError):
         return []
+    data = data.get(key) if key and isinstance(data, dict) else data
     return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
 
 
@@ -170,6 +171,10 @@ def describe(event, payload):
         prs = run.get("pull_requests") or []
         number = prs[0]["number"] if prs else None
         label = f"PR #{number}" if number else f"branch run {safe(run.get('head_branch', ''))}"
+        failed = [name for name in map(safe, run.get("failed_jobs") or []) if name]
+        if failed:  # names that safe() empties fall back to "CI finished (failure)"
+            names = ", ".join(failed[:3]) + (f" +{len(failed) - 3}" if len(failed) > 3 else "")
+            return f"{repo}: CI failure", f"CI failed ({names}) for {label}", number
         return f"{repo}: CI {conclusion}", f"CI finished ({conclusion}) for {label}", number
     if event == "issue_comment" and payload.get("action") == "created" and payload.get("issue", {}).get("pull_request"):
         number = payload["issue"]["number"]
@@ -225,6 +230,14 @@ def handle(event, payload, repos):
         number = run_pr(repo, run)  # before the enqueue: 200 means stored, so the event cannot wait for a later lookup
         if number:
             payload = {**payload, "workflow_run": {**run, "pull_requests": [{"number": number}]}}
+    if local and event == "workflow_run" and payload.get("action") == "completed" and run.get("conclusion") == "cancelled":
+        # a run cancelled after a job failed is a failure: its conclusion alone reads as a superseded run
+        # shortcut: one page of jobs, a failed job past the 100th is missed; paginate if a repo runs bigger matrices
+        jobs = gh_api(f"repos/{safe(repo, 200)}/actions/runs/{int(run['id'])}/attempts/{int(run.get('run_attempt') or 1)}/jobs?per_page=100", "jobs")
+        failed = [job.get("name") or "" for job in jobs if job.get("conclusion") in ("failure", "timed_out")]
+        if failed:  # a failed jobs call keeps the run's own conclusion
+            payload = {**payload, "workflow_run": {**payload["workflow_run"], "conclusion": "failure", "failed_jobs": failed}}
+    run = payload.get("workflow_run") or {}
     summary = describe(event, payload)
     if not local or not summary:
         return "ignored"
