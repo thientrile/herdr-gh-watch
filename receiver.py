@@ -481,9 +481,10 @@ def pr_events(name, pr, now, in_base):
     if pr["isDraft"] or not HEX.fullmatch(head) or not commits or commits[-1]["oid"] != head:
         return []
     merge, rollup = pr["mergeStateStatus"], (commits[-1].get("statusCheckRollup") or {}).get("state")
-    ready = merge != "UNKNOWN" and rollup == "SUCCESS" and all(t["isResolved"] for t in pr["reviewThreads"]["nodes"])
+    # DIRTY (conflicts), BLOCKED (e.g. a required approval) and UNKNOWN (still computing) have another obstacle
+    ready = merge in ("BEHIND", "CLEAN", "HAS_HOOKS", "UNSTABLE") and rollup == "SUCCESS" and all(t["isResolved"] for t in pr["reviewThreads"]["nodes"])
     old = now - datetime.fromisoformat(str(commits[-1]["committedDate"]).replace("Z", "+00:00")) > CODEX_SLOW
-    if not ready and not old:  # UNKNOWN: GitHub is still computing it, the next poll looks again
+    if not ready and not old:
         return []
     state, _ = codex_state(pr, in_base)
     events = []
@@ -523,6 +524,8 @@ def scan(repo, repos):
             print(f"scan {name}: skipped a malformed PR: {type(error).__name__}", flush=True)
             continue
         for kind, eid, message, hint in events:
+            if sum(counts.values()) == RECONCILE_CAP:
+                return f"cap {RECONCILE_CAP} reached, the rest wait for the next poll"
             try:
                 result = queue(name, repos[repo], eid, kind, message, hint, f"{safe(name)} #{pr['number']}: {kind}", pr.get("headRefName"), True)
             except RuntimeError as error:

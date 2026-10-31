@@ -384,6 +384,8 @@ assert line == "1 behind, 0 codex slow queued from 1 open PRs", line
 assert scanned(open_pr(number=8, merge="CLEAN", auto=False, comments=clean))[1][0][3] == "PR #8 is ready but auto-merge off in acme/app"
 assert scanned(open_pr(number=9, merge="CLEAN", auto=True, comments=clean))[1] == []  # auto-merge on and up to date: it merges itself
 assert scanned(open_pr(number=10, merge="UNKNOWN", comments=clean))[1] == []  # GitHub still computing: next poll
+for merge in ("DIRTY", "BLOCKED", "DRAFT"):  # another obstacle than auto-merge: not "ready"
+    assert scanned(open_pr(number=10, merge=merge, auto=False, comments=clean))[1] == [], merge
 assert scanned(open_pr(number=11, threads=(True, False), comments=clean))[1] == []  # an unresolved thread
 assert scanned(open_pr(number=12, commits=[commit(A, ["0" * 40], rollup="PENDING")], comments=clean))[1] == []
 assert scanned(open_pr(number=13, comments=[summary(A, findings=True)]))[1] == []  # findings: not ready
@@ -421,6 +423,11 @@ late_merges = [commit(A, ["0" * 40]), commit(M, [A, "e" * 40], at="2026-10-29T16
 assert scanned(open_pr(number=23, merge="BLOCKED", commits=late_merges, comments=clean))[1] == []
 assert scanned(open_pr(number=24, merge="BLOCKED", commits=late_merges, reviews=[findings_review]))[1] == []
 
+# the cap: at most RECONCILE_CAP new wakes per scan, duplicates do not count, the next poll queues the rest
+many = [open_pr(number=100 + i, comments=clean) for i in range(25)]
+line, out = scanned(*many)
+assert len(out) == 20 and "cap 20 reached" in line, line
+assert len(scanned(*many)[1]) == 25  # 20 duplicates, then the last 5
 # malformed data and a failed query only log; a failed enqueue stops the scan for the next poll
 assert scanned({"number": "x"}, open_pr(number=25, comments=clean))[1][0][0] == f"behind:25:{A}"
 receiver.gh_get = lambda path, etag="", fields=(): (502, {}, None)
