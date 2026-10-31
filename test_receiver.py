@@ -123,7 +123,7 @@ assert send("pull_request_review", attack, "")[0] == 400 and wake_calls() == [] 
 assert send("pull_request_review", attack, "g-1") == (200, "wake enqueued")
 assert wake_calls()[-1] == ["enqueue", "--source", "gh-watch", "--id", "review:501", "--cwd", checkout, "--repo", "acme/app",
                        "--kind", "review", "--text", "new review (approved) on PR #7 in acme/app",
-                       "--hint", "gh pr view 7 --comments", "--branch", "feat/x"], wake_calls()[-1]
+                       "--hint", "gh pr view 7 --comments -R acme/app", "--branch", "feat/x"], wake_calls()[-1]
 assert send("pull_request_review", attack, "g-1") == (200, "wake duplicate")  # GitHub redelivery: dedup is wake's
 assert send("pull_request_review", attack, "g-1b") == (200, "wake duplicate")  # the id is the review's, not the delivery's
 comment = {"action": "created", "repository": repo, "issue": {"number": 7, "pull_request": {"url": "u"}, "title": free_text},
@@ -142,7 +142,7 @@ answers["abc123"] = [{"number": 5, "state": "open", "head": {"ref": "fix-x", "re
 fork_event = {"action": "completed", "repository": repo, "workflow_run": {**fork_run, "head_branch": "fix-x"}}
 assert send("workflow_run", fork_event, "g-7") == (200, "wake enqueued")
 call = wake_calls()[-1]
-assert call[call.index("--kind") + 1] == "ci_failure" and call[call.index("--hint") + 1] == "gh pr checks 5"
+assert call[call.index("--kind") + 1] == "ci_failure" and call[call.index("--hint") + 1] == "gh pr checks 5 -R acme/app"
 assert call[call.index("--text") + 1] == "CI finished (failure) for PR #5 in acme/app", call
 calls[:] = []  # a push run on the default branch has no PR: no lookup on the request path
 main_run = {**fork_run, "id": 802, "head_branch": "main", "head_repository": {"full_name": "acme/app"}}
@@ -358,8 +358,12 @@ def open_pr(number=7, merge="BEHIND", auto=True, commits=None, comments=(), revi
             "reviews": {"nodes": list(reviews)}, "comments": {"nodes": list(comments)}}
 
 
+fields_seen = []
+
+
 def scan_get(path, etag="", fields=()):
     scan_gets.append(path)
+    fields_seen.append(fields) if fields else None
     if path == "graphql":
         return 200, {"date": NOW}, {"data": {"repository": {"pullRequests": {"nodes": scan_data["prs"]}}}}
     sha = path.rsplit("...", 1)[1]
@@ -401,6 +405,10 @@ merged_head = [commit(A, ["0" * 40]), commit(M, [A, "e" * 40], at="2026-10-29T16
 _, out = scanned(open_pr(number=17, commits=merged_head, comments=clean))
 assert out == [(f"behind:17:{M2}", "behind", coord, "PR #17 is ready but behind base in acme/app", False)], out
 assert any(g.startswith("repos/acme/app/compare/main...") for g in scan_gets)
+receiver.gh_get = lambda path, etag="", fields=(): scan_get(path) if path == "graphql" else (502, {}, None)
+assert scanned(open_pr(number=17, merge="BLOCKED", commits=[commit(A, ["0" * 40]), commit(M, [A, "e" * 40])], comments=clean))[1] == []
+receiver.gh_get = scan_get  # a failed ancestry lookup skips the PR this poll: no false codex_slow
+assert ("-f", "owner=acme") == tuple(fields_seen[-1][2:4]) and "-F" not in fields_seen[-1]  # names stay strings, even "123"
 foreign = [commit(A, ["0" * 40]), commit(M, [A, "f" * 40], at="2026-10-29T16:59:00Z")]
 assert scanned(open_pr(number=18, commits=foreign, comments=clean))[1] == []
 not_merge = [commit(A, ["0" * 40]), commit(B, [A], at="2026-10-29T16:59:00Z")]

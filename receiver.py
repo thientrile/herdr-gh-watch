@@ -260,7 +260,8 @@ def queue(repo, entry, eid, kind, message, hint, title, head, coordinator):
     local, coord = entry
     coord = coord if coordinator else ""
     args = ["--source", "gh-watch", "--id", eid, "--cwd", os.path.abspath(coord or local), "--repo", safe(repo, 200),
-            "--kind", kind, "--text", f"{message} in {safe(repo)}", "--hint", hint]
+            "--kind", kind, "--text", f"{message} in {safe(repo)}",
+            "--hint", f"{hint} -R {safe(repo, 200)}" if hint.startswith(("gh pr ", "gh run ")) else hint]  # a coordinator dir is no checkout
     branch = str(head) if not coord and BRANCH.fullmatch(str(head)) else ""
     try:
         status = enqueue(*args, *(["--branch", branch] if branch else []))
@@ -502,7 +503,7 @@ def scan(repo, repos):
     """The open PRs of a repo, read with one GraphQL query, as `behind` and `codex_slow` wakes; a log line."""
     name = safe(repo, 200)
     owner, _, short = name.partition("/")
-    status, headers, data = gh_get("graphql", fields=("-f", f"query={SCAN}", "-F", f"owner={owner}", "-F", f"name={short}"))
+    status, headers, data = gh_get("graphql", fields=("-f", f"query={SCAN}", "-f", f"owner={owner}", "-f", f"name={short}"))
     try:
         prs = [pr for pr in data["data"]["repository"]["pullRequests"]["nodes"] if isinstance(pr, dict)]
         now = email.utils.parsedate_to_datetime(headers["date"])  # GitHub's clock, never ours
@@ -516,7 +517,9 @@ def scan(repo, repos):
         def in_base(sha, base=base):
             if (base, sha) not in known:  # compare base...sha is "behind" or "identical" when sha is in the base branch
                 status, _, diff = gh_get(f"repos/{name}/compare/{urllib.parse.quote(base, safe='')}...{safe(sha, 40)}")
-                known[base, sha] = status == 200 and isinstance(diff, dict) and diff.get("status") in ("behind", "identical")
+                if status != 200 or not isinstance(diff, dict):  # unknown is not "outside the base": skip the PR this poll
+                    raise ValueError(f"compare: HTTP {status}")
+                known[base, sha] = diff.get("status") in ("behind", "identical")
             return known[base, sha]
         try:
             events = pr_events(name, pr, now, in_base)
