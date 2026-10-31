@@ -431,7 +431,7 @@ SCAN = """query($owner: String!, $name: String!) { repository(owner: $owner, nam
   pullRequests(states: OPEN, first: 50, orderBy: {field: UPDATED_AT, direction: DESC}) { nodes {
     number isDraft mergeStateStatus headRefOid headRefName baseRefName autoMergeRequest { enabledAt }
     commits(last: 30) { nodes { commit { oid committedDate parents(first: 3) { nodes { oid } } statusCheckRollup { state } } } }
-    reviewThreads(first: 100) { nodes { isResolved } }
+    reviewThreads(first: 100) { totalCount nodes { isResolved } }
     reviews(last: 30) { nodes { author { login } body commit { oid } comments { totalCount } } }
     comments(last: 50) { nodes { author { login } body } } } } } }"""
 HEX = re.compile(r"[0-9a-f]{40}")
@@ -441,9 +441,9 @@ def codex_state(pr, in_base):
     """("clean" | "findings" | "pending", n) of Codex for the PR head, from the codex-review-state:v1 summary, else the
     clean receipts and findings reviews. A review of an earlier commit still counts when every later commit is an
     update-branch merge: two parents, the first the commit before it, the second already in the base (in_base(sha))."""
-    commits = [node["commit"] for node in pr["commits"]["nodes"]]
+    commits, summary_state = [node["commit"] for node in pr["commits"]["nodes"]], None
     oids, bot = [c["oid"] for c in commits], (CODEX_BOT, CODEX_BOT.removesuffix("[bot]"))
-    states, reviewed = {}, None
+    states = {}
     for review in pr["reviews"]["nodes"]:
         if (review.get("author") or {}).get("login") in bot and review.get("commit"):
             states[review["commit"]["oid"]] = ("clean", 0) if CODEX_CLEAN in str(review.get("body")) \
@@ -455,17 +455,15 @@ def codex_state(pr, in_base):
         if summary:
             code = (json.loads(summary.group(1)).get("code_review") or {})
             if code.get("status") == "completed" and HEX.fullmatch(str(code.get("commit_sha"))):
-                reviewed = code["commit_sha"]
-                findings = code.get("has_any_findings") is not False
-                summary_state = ("findings", states.get(reviewed, ("", 0))[1]) if findings else ("clean", 0)
+                sha = code["commit_sha"]
+                summary_state = (sha, ("findings", states.get(sha, ("", 0))[1]) if code.get("has_any_findings") is not False else ("clean", 0))
         elif receipt:
             for oid in oids:
                 if oid.startswith(receipt.group(1)):
                     states.setdefault(oid, ("clean", 0))  # a findings review of the same commit wins
-    if reviewed:
-        states[reviewed] = summary_state
-    else:
-        reviewed = next((oid for oid in reversed(oids) if oid in states), None)
+    if summary_state:  # the summary wins for its own commit; a newer review or receipt still wins over it
+        states[summary_state[0]] = summary_state[1]
+    reviewed = next((oid for oid in reversed(oids) if oid in states), None)
     if reviewed not in oids:
         return "pending", 0
     for i in range(oids.index(reviewed) + 1, len(oids)):
@@ -483,7 +481,9 @@ def pr_events(name, pr, now, in_base):
         return []
     merge, rollup = pr["mergeStateStatus"], (commits[-1].get("statusCheckRollup") or {}).get("state")
     # DIRTY (conflicts), BLOCKED (e.g. a required approval) and UNKNOWN (still computing) have another obstacle
-    ready = merge in ("BEHIND", "CLEAN", "HAS_HOOKS", "UNSTABLE") and rollup == "SUCCESS" and all(t["isResolved"] for t in pr["reviewThreads"]["nodes"])
+    threads = pr["reviewThreads"]  # past the first 100 the rest are unknown: not ready
+    ready = merge in ("BEHIND", "CLEAN", "HAS_HOOKS", "UNSTABLE") and rollup == "SUCCESS" and \
+        threads["totalCount"] <= len(threads["nodes"]) and all(t["isResolved"] for t in threads["nodes"])
     old = now - datetime.fromisoformat(str(commits[-1]["committedDate"]).replace("Z", "+00:00")) > CODEX_SLOW
     if not ready and not old:
         return []

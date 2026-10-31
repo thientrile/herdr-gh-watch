@@ -350,11 +350,11 @@ def summary(sha, findings=False, status="completed"):
             f"<!-- codex-review-state:v1 {json.dumps(state)} -->\n## Codex Review Summary"}
 
 
-def open_pr(number=7, merge="BEHIND", auto=True, commits=None, comments=(), reviews=(), threads=(True,), draft=False):
+def open_pr(number=7, merge="BEHIND", auto=True, commits=None, comments=(), reviews=(), threads=(True,), draft=False, extra_threads=0):
     commits = commits or [commit(A, ["0" * 40])]
     return {"number": number, "isDraft": draft, "mergeStateStatus": merge, "headRefOid": commits[-1]["commit"]["oid"],
             "headRefName": "feat/x", "baseRefName": "main", "autoMergeRequest": {"enabledAt": "x"} if auto else None,
-            "commits": {"nodes": commits}, "reviewThreads": {"nodes": [{"isResolved": r} for r in threads]},
+            "commits": {"nodes": commits}, "reviewThreads": {"totalCount": len(threads) + extra_threads, "nodes": [{"isResolved": r} for r in threads]},
             "reviews": {"nodes": list(reviews)}, "comments": {"nodes": list(comments)}}
 
 
@@ -422,6 +422,15 @@ assert receiver.codex_state(open_pr(reviews=[findings_review], comments=[receipt
 assert receiver.codex_state(open_pr(reviews=[findings_review]), None) == ("findings", 2)
 assert receiver.codex_state(open_pr(comments=[summary(A, status="in_progress")]), None) == ("pending", 0)
 assert receiver.codex_state(open_pr(comments=[{**receipt_comment, "author": {"login": "someone"}}]), None) == ("pending", 0)
+
+# an older summary does not hide a newer review or receipt; the summary wins only for its own commit
+two = [commit(A, ["0" * 40]), commit(B, [A])]
+findings_b = {**findings_review, "commit": {"oid": B}}
+assert receiver.codex_state(open_pr(commits=two, reviews=[findings_b], comments=clean), None) == ("findings", 2)
+receipt_b = {**receipt_comment, "body": receipt.replace("aaaaaaaaaa", "bbbbbbbbbb")}
+assert receiver.codex_state(open_pr(commits=two, comments=[summary(A, findings=True), receipt_b]), None) == ("clean", 0)
+assert receiver.codex_state(open_pr(reviews=[findings_review], comments=clean), None) == ("clean", 0)  # same commit: summary
+assert scanned(open_pr(number=27, comments=clean, extra_threads=1))[1] == []  # 101 threads: the unread one may be unresolved
 
 # codex_slow: head older than 30 min with no Codex review; never on update-branch merges after a review
 _, out = scanned(open_pr(number=21, merge="BLOCKED", commits=[commit(A, ["0" * 40], at="2026-10-29T16:29:00Z")]))
