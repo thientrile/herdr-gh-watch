@@ -6,7 +6,9 @@ A small webhook receiver (Python standard library only) listens on `127.0.0.1:87
 
 - a submitted review, a new PR comment or inline code comment,
 - a finished CI run (`workflow_run`),
-- a merged PR.
+- a merged PR, or auto-merge turned on or off,
+- Codex's review of a PR (clean or findings, see [Codex](#codex)),
+- an open PR that is ready but waits (`behind`), or that Codex has not reviewed (`codex_slow`); see [reconcile](#missed-webhooks-reconcile).
 
 Each event shows a herdr notification and is handed to the [herdr-wake](https://github.com/thientrile/herdr-wake) queue with `wake enqueue`. herdr-wake stores it on disk and wakes the agent working in a checkout (or any worktree) of that repo once it is idle, preferring the one on the PR's branch. Events that pile up while the agent is busy arrive together:
 
@@ -16,7 +18,7 @@ Each event shows a herdr notification and is handed to the [herdr-wake](https://
 - [gh-watch] CI finished (failure) for PR #7 in acme/app — check: gh pr checks 7
 ```
 
-The agent then reads the PR itself with `gh`. Each event is queued under an id taken from the event itself (`review:<id>`, `comment:<id>`, `run:<id>:<attempt>`, `pr:<id>:merged`), so a redelivery, or the same event found again by [reconcile](#missed-webhooks-reconcile), is queued once. gh-watch never prompts an agent itself: queueing, routing, retries and delivery are herdr-wake's job.
+The agent then reads the PR itself with `gh`. Each event is queued under an id taken from the event itself (`review:<id>`, `comment:<id>`, `run:<id>:<attempt>`, `pr:<id>:merged`, `pr:<id>:auto_merge_<enabled|disabled>:<head sha>`, `behind:<pr>:<head sha>`, `codex:<pr>:<head sha>:slow`), so a redelivery, or the same event found again by [reconcile](#missed-webhooks-reconcile), is queued once. gh-watch never prompts an agent itself: queueing, routing, retries and delivery are herdr-wake's job.
 
 ## Install
 
@@ -42,7 +44,7 @@ All files live in `$cfg`; see [`examples/`](examples). Only `repos.tsv` is neede
 | File | What it holds |
 | --- | --- |
 | `secret` | Webhook secret, created on first start (mode 600). Paste it into GitHub; never commit it. |
-| `repos.tsv` | `owner/name<TAB>/local/path`, one per line. Events for other repos are ignored. |
+| `repos.tsv` | `owner/name<TAB>/local/path`, one per line, with an optional third column `<TAB>/coordinator/dir` (see [Routing](#routing)). Events for other repos are ignored. |
 | `ignore_users` | GitHub logins, one per line. Reviews and comments they write are skipped (CI results and merges are not). Put your own login here. |
 | `notify_cmd` | Optional. A command that gets `GitHub: <title>` as its last argument, e.g. a Telegram sender. Skipped when the file is missing or the command fails. |
 | `review_repos` | Optional. Repos (`owner/name`, one per line) that get one automated review when a PR is opened or marked ready. |
@@ -51,6 +53,28 @@ All files live in `$cfg`; see [`examples/`](examples). Only `repos.tsv` is neede
 | `tunnel_cmd` | Optional. A tunnel command (e.g. `cloudflared tunnel run gh-watch`) started with the receiver and stopped with it; its output goes to `receiver.log`. Read at start only, so restart after editing. Leave it out if you run your tunnel some other way. |
 
 Lines starting with `#` are comments. The port is `GH_WATCH_PORT` (default 8787); `HERDR_WAKE_BIN` overrides the `wake` command; `GH_WATCH_DRY_RUN=1` logs what would be queued instead of queueing it.
+
+## Routing
+
+Without a third column in `repos.tsv`, every event goes to the checkout with `--branch <PR branch>`, so herdr-wake prefers the agent on that branch.
+
+With a third column, the coordinator dir (e.g. a herdr-projects project folder such as `~/.herdr-projects/my-app`), the events someone has to act on at the project level go there instead, with no `--branch`:
+
+| To the coordinator dir | To the checkout, on the PR branch |
+| --- | --- |
+| `merged`, `auto_merge`, `behind`, approved reviews, `ci_success`, `codex_clean`, `codex_slow` | other CI results (`ci_failure`, ...), comments, other reviews, `codex_findings` |
+
+Each event is queued once, to one place. herdr-wake then picks the pane whose cwd is exactly the coordinator dir. When no agent runs there, its fallback order applies: first a pane whose cwd is **below** the coordinator dir (for example a thread working in `<coordinator dir>/threads/...`), the deepest one first; then an agent in any checkout or worktree of the repo (matched by its `origin` remote, since a project folder is not a git repo). So with the coordinator pane closed, a thread inside the project folder gets the coordinator's events. Keep the coordinator pane open, or leave the third column out.
+
+## Codex
+
+Codex (login `chatgpt-codex-connector[bot]`, the `CODEX_BOT` constant in `receiver.py`; change it there if your Codex app posts under another login) is read without forwarding any of its text:
+
+- A comment or review from that login containing its fixed receipt "Didn't find any major issues" is `codex_clean`.
+- A review from it with any other body is `codex_findings`, with the number of its inline comments in the text (`Codex findings (3) on PR #7`).
+- Its inline comments and its `codex-pull-request-review-summary` comment (edited in place) wake nobody: the review above already counts them.
+
+For open PRs, the scan below derives one state per head: **clean**, **findings(n)** or **pending**. It reads the `codex-review-state:v1` summary first (full commit sha, `status`, `has_any_findings`), else the clean receipts (matched on their short "Reviewed commit" sha) and findings reviews. A review of an earlier commit still counts at the head when every later commit is an update-branch merge: two parents, the first the commit before it, the second already in the base branch (`GET /compare`). Codex does not review those merges itself.
 
 ## Responses
 
@@ -70,13 +94,16 @@ GitHub does not retry a webhook delivery that failed, so events that happen whil
 
 - `GET /repos/{owner}/{repo}/events` for reviews, PR comments, inline comments and merges (the feed's `actor` becomes the webhook's `sender`, so `ignore_users` still applies). The feed trims PR objects, so a closed PR is looked up once to see whether it was merged; if comment payloads come back trimmed too, comments are read from `/issues/comments` and `/pulls/comments` instead.
 - `GET /repos/{owner}/{repo}/actions/runs?status=completed&created>=...` for CI.
+- One GraphQL query over the 50 most recently updated open PRs (merge state, auto-merge, the head's check rollup, review threads, Codex reviews and comments). It queues:
+  - `behind` (`behind:<pr>:<head sha>`) when the head's checks are all green (rollup `SUCCESS`), Codex is clean at the head, no review thread is unresolved, and the PR is `BEHIND` its base or has auto-merge off. The text says which: `PR #7 is ready but behind base` or `... but auto-merge off`. `mergeStateStatus` `UNKNOWN` means GitHub is still computing it, so the PR is skipped until the next poll. Drafts are skipped.
+  - `codex_slow` (`codex:<pr>:<head sha>:slow`) when the head commit is older than 30 minutes (`CODEX_SLOW`) and Codex has not reviewed it (update-branch merges after a review count as reviewed).
 
 Each result is shaped like its webhook and goes through the same path as a live delivery, with the same id, so herdr-wake drops what was already queued. A cursor per repo (`reconcile-<owner>_<repo>.json` in the state dir) holds GitHub's time of the last complete poll; each poll re-reads one hour before it. The cursor only moves when every enqueue succeeded, and the events request sends the ETag, so an unchanged feed costs no rate limit.
 
 - **First start**: the cursor is set to now and nothing older is ever replayed, not even by the one-hour overlap (so events queued by v0.3 under delivery ids are never queued again).
 - **`MAX_LOOKBACK` = 7 days**: a cursor older than that reads from 7 days ago and logs the gap it skipped. herdr-wake must keep ids for dedup longer than this.
 - **At most 20 new wakes per repo per poll**; the rest are logged and picked up by the next poll.
-- Results show in `receiver.log` as `reconcile owner/repo: ...`.
+- Results show in `receiver.log` as `reconcile owner/repo: ...` and `scan owner/repo: N behind, M codex slow queued from K open PRs`.
 
 Limits: the events feed lags behind real time by about 30 seconds to 6 hours and holds only the last 300 events, so an event that shows up in the feed more than an hour after it happened, or that falls out of a busy feed, is missed. Only the newest 100 CI runs per poll are read (the log says how many older ones were skipped). CI runs are matched by when they were created, so a re-run of an old run, or a run that finishes long after it started, can be missed. For anything missed, open the webhook's Recent Deliveries in the repo settings and press **Redeliver**.
 
@@ -142,7 +169,7 @@ GitHub sends a `ping` first; a green check means the signature matched. Then add
 
 ```sh
 herdr plugin link "$PWD"
-python3 test_receiver.py     # describe(), the workflow_run PR lookup, the webhook checks, `wake enqueue`, reconcile and tunnel_cmd; no herdr, wake or network needed
+python3 test_receiver.py     # describe(), the PR lookup, webhook checks, routing, Codex, `wake enqueue`, reconcile, the scan and tunnel_cmd; no herdr, wake or network needed
 HERDR_PLUGIN_CONFIG_DIR="$cfg" python3 receiver.py --review-once owner/repo 12   # print a review without posting it (add --post to post)
 ```
 

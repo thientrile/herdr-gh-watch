@@ -2,11 +2,13 @@
 
 Verifies the HMAC signature, then queues a wake for the herdr agent working in
 the matching checkout with `wake enqueue` (the herdr-wake plugin delivers it)
-when a review, a comment, a finished CI run or a merge happened. Only fixed text
+when a review, a comment, a finished CI run, a merge or an auto-merge change happened
+(project-level events go to a coordinator dir when repos.tsv names one). Only fixed text
 built from enum fields and sanitized identifiers is ever queued: PR titles,
 comments and branch names from the payload are attacker-controlled data and
 never reach a prompt. A thread polls GitHub for events missed while the receiver
-was unreachable and passes them through the same path (reconcile()).
+was unreachable and passes them through the same path (reconcile()), and scans open PRs for
+ones that are ready but wait, or that Codex has not reviewed (scan()).
 """
 import email.utils
 import hashlib
@@ -45,6 +47,12 @@ RECONCILE_EVERY = 600
 OVERLAP = timedelta(hours=1)  # each poll re-reads this much before the cursor; herdr-wake dedups the repeats
 MAX_LOOKBACK = timedelta(days=7)  # herdr-wake keeps ids longer than this, so a re-read never wakes twice
 RECONCILE_CAP = 20  # new wakes per repo per poll
+CODEX_BOT = "chatgpt-codex-connector[bot]"  # REST login; GraphQL drops the "[bot]"
+CODEX_CLEAN = "Didn't find any major issues"  # Codex's fixed clean receipt: matched, never forwarded
+CODEX_STATE = re.compile(r"<!-- codex-review-state:v1 (\{.*?\}) -->")
+CODEX_SLOW = timedelta(minutes=30)
+# events the project coordinator acts on (merge, update-branch, auto-merge); the rest go to the branch's thread
+COORD_KINDS = {"merged", "behind", "auto_merge", "ci_success", "codex_clean", "codex_slow"}  # and approved reviews
 
 
 def safe(value, limit=60):
@@ -62,13 +70,14 @@ def load_secret():
 
 
 def load_repos():
-    """repos.tsv: `owner/name<TAB>/local/path`, one per line. Unlisted repos are ignored."""
+    """repos.tsv: `owner/name<TAB>/local/path[<TAB>/coordinator/dir]`, one per line, as {name: (path, coord or "")}."""
     repos = {}
     try:
         for line in open(os.path.join(CONFIG, "repos.tsv")):
-            name, _, path = line.rstrip("\n").partition("\t")
+            name, _, rest = line.rstrip("\n").partition("\t")
+            path, _, coord = rest.partition("\t")
             if name and path and not name.startswith("#"):
-                repos[name] = os.path.expanduser(path)
+                repos[name] = (os.path.expanduser(path), os.path.expanduser(coord.strip()) if coord.strip() else "")
     except OSError:
         pass
     return repos
@@ -171,6 +180,23 @@ def describe(event, payload):
     if event == "pull_request" and payload.get("action") == "closed" and payload["pull_request"].get("merged"):
         number = payload["pull_request"]["number"]
         return f"{repo} #{number}: merged", f"PR #{number} was merged", number
+    if event == "pull_request" and payload.get("action") in ("auto_merge_enabled", "auto_merge_disabled"):
+        number, word = payload["pull_request"]["number"], payload["action"].split("_")[-1]
+        return f"{repo} #{number}: auto-merge {word}", f"auto-merge {word} on PR #{number}", number
+    return None
+
+
+def codex_kind(event, payload):
+    """codex_clean, codex_findings or "skip" for Codex's own events, None for anyone else's. Bodies are matched, never forwarded."""
+    if (payload.get("sender") or {}).get("login") != CODEX_BOT:
+        return None
+    body = str((payload.get("review") or payload.get("comment") or {}).get("body") or "")
+    if CODEX_CLEAN in body:
+        return "codex_clean"
+    if event == "pull_request_review":
+        return "codex_findings"
+    if event == "pull_request_review_comment" or "codex-pull-request-review-summary" in body:
+        return "skip"  # the findings review counts its inline comments; the summary is edited in place
     return None
 
 
@@ -183,7 +209,10 @@ def event_id(event, payload):
     if event == "workflow_run":
         run = payload["workflow_run"]
         return f"run:{int(run['id'])}:{int(run.get('run_attempt') or 1)}"
-    return f"pr:{int(payload['pull_request']['id'])}:merged"
+    pr = payload["pull_request"]
+    if payload.get("action") != "closed":  # shortcut: a second toggle to the same state on the same head is a duplicate
+        return f"pr:{int(pr['id'])}:{safe(payload['action'], 20)}:{safe((pr.get('head') or {}).get('sha', ''), 40)}"
+    return f"pr:{int(pr['id'])}:merged"
 
 
 def handle(event, payload, repos):
@@ -200,21 +229,39 @@ def handle(event, payload, repos):
     if not local or not summary:
         return "ignored"
     title, message, number = summary
+    codex = codex_kind(event, payload)
+    if codex == "skip":
+        return "ignored (codex)"
     feedback = event in ("pull_request_review", "issue_comment", "pull_request_review_comment")
     # only comments and reviews are skipped when you wrote them; CI results and merges you triggered still matter
     is_auto_review = str((payload.get("review") or {}).get("body") or "").startswith(MARK)  # boolean only, the text is never forwarded
     if feedback and not is_auto_review and safe(payload.get("sender", {}).get("login", "")) in ignored_users():
         return "ignored (own activity)"
     head = (payload.get("pull_request") or run).get("head", {}).get("ref") or run.get("head_branch", "")
-    if event == "workflow_run":
+    if codex == "codex_clean":
+        kind, hint, title = codex, f"gh pr view {number} --json mergeStateStatus,autoMergeRequest", f"{safe(repo)} #{number}: Codex clean"
+        message = f"Codex found no major issues on PR #{number}"
+    elif codex:
+        found = gh_api(f"repos/{safe(repo, 200)}/pulls/{int(number)}/reviews/{int(payload['review']['id'])}/comments?per_page=100")
+        kind, hint, title = codex, f"gh api repos/{safe(repo, 200)}/pulls/{number}/comments", f"{safe(repo)} #{number}: Codex findings"
+        message = f"Codex findings ({len(found) or '?'}) on PR #{number}"
+    elif event == "workflow_run":
         kind, hint = "ci_" + re.sub(r"[^a-z0-9_]", "", str(run.get("conclusion") or "").lower())[:20], \
             f"gh pr checks {number}" if number else "gh run list --limit 3"
     else:
-        kind = {"pull_request_review": "review", "pull_request": "merged"}.get(event, "comment")
+        kind = {"pull_request_review": "review", "pull_request": "merged" if payload.get("action") == "closed" else "auto_merge"}.get(event, "comment")
         hint = f"gh pr view {number} --comments"
-    args = ["--source", "gh-watch", "--id", event_id(event, payload), "--cwd", os.path.abspath(local), "--repo", safe(repo, 200),
+    approved = kind == "review" and str(payload["review"].get("state", "")).lower() == "approved"
+    return queue(repo, local, event_id(event, payload), kind, message, hint, title, head, kind in COORD_KINDS or approved)
+
+
+def queue(repo, entry, eid, kind, message, hint, title, head, coordinator):
+    """One `wake enqueue`: to the coordinator dir without --branch when repos.tsv names one, else to the checkout on the PR branch."""
+    local, coord = entry
+    coord = coord if coordinator else ""
+    args = ["--source", "gh-watch", "--id", eid, "--cwd", os.path.abspath(coord or local), "--repo", safe(repo, 200),
             "--kind", kind, "--text", f"{message} in {safe(repo)}", "--hint", hint]
-    branch = str(head) if BRANCH.fullmatch(str(head)) else ""
+    branch = str(head) if not coord and BRANCH.fullmatch(str(head)) else ""
     try:
         status = enqueue(*args, *(["--branch", branch] if branch else []))
     except RuntimeError:
@@ -238,10 +285,10 @@ def notify_user(title):
             pass
 
 
-def gh_get(path, etag=""):
+def gh_get(path, etag="", fields=()):
     """(HTTP status, lowercased headers, JSON body) of a read-only `gh api -i` call; status 0 when gh could not run."""
     try:
-        done = subprocess.run(["gh", "api", "-i", path, *(["-H", f"If-None-Match: {etag}"] if etag else [])],
+        done = subprocess.run(["gh", "api", "-i", path, *fields, *(["-H", f"If-None-Match: {etag}"] if etag else [])],
                               capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
         return 0, {}, None
@@ -378,14 +425,121 @@ def save_cursor(path, state):
     os.replace(path + ".tmp", path)
 
 
+# shortcut: the 50 most recently updated open PRs, 30 commits and reviews each; page if a repo keeps more open
+SCAN = """query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) {
+  pullRequests(states: OPEN, first: 50, orderBy: {field: UPDATED_AT, direction: DESC}) { nodes {
+    number isDraft mergeStateStatus headRefOid headRefName baseRefName autoMergeRequest { enabledAt }
+    commits(last: 30) { nodes { commit { oid committedDate parents(first: 3) { nodes { oid } } statusCheckRollup { state } } } }
+    reviewThreads(first: 100) { nodes { isResolved } }
+    reviews(last: 30) { nodes { author { login } body commit { oid } comments { totalCount } } }
+    comments(last: 50) { nodes { author { login } body } } } } } }"""
+HEX = re.compile(r"[0-9a-f]{40}")
+
+
+def codex_state(pr, in_base):
+    """("clean" | "findings" | "pending", n) of Codex for the PR head, from the codex-review-state:v1 summary, else the
+    clean receipts and findings reviews. A review of an earlier commit still counts when every later commit is an
+    update-branch merge: two parents, the first the commit before it, the second already in the base (in_base(sha))."""
+    commits = [node["commit"] for node in pr["commits"]["nodes"]]
+    oids, bot = [c["oid"] for c in commits], (CODEX_BOT, CODEX_BOT.removesuffix("[bot]"))
+    states, reviewed = {}, None
+    for review in pr["reviews"]["nodes"]:
+        if (review.get("author") or {}).get("login") in bot and review.get("commit"):
+            states[review["commit"]["oid"]] = ("clean", 0) if CODEX_CLEAN in str(review.get("body")) \
+                else ("findings", int(review["comments"]["totalCount"]))
+    for comment in pr["comments"]["nodes"]:
+        body = str(comment.get("body") or "") if (comment.get("author") or {}).get("login") in bot else ""
+        summary = CODEX_STATE.search(body)
+        receipt = re.search(r"Reviewed commit:\*\* `([0-9a-f]{7,40})`", body) if CODEX_CLEAN in body else None
+        if summary:
+            code = (json.loads(summary.group(1)).get("code_review") or {})
+            if code.get("status") == "completed" and HEX.fullmatch(str(code.get("commit_sha"))):
+                reviewed = code["commit_sha"]
+                findings = code.get("has_any_findings") is not False
+                summary_state = ("findings", states.get(reviewed, ("", 0))[1]) if findings else ("clean", 0)
+        elif receipt:
+            for oid in oids:
+                if oid.startswith(receipt.group(1)):
+                    states.setdefault(oid, ("clean", 0))  # a findings review of the same commit wins
+    if reviewed:
+        states[reviewed] = summary_state
+    else:
+        reviewed = next((oid for oid in reversed(oids) if oid in states), None)
+    if reviewed not in oids:
+        return "pending", 0
+    for i in range(oids.index(reviewed) + 1, len(oids)):
+        parents = [p["oid"] for p in commits[i]["parents"]["nodes"]]
+        if len(parents) != 2 or parents[0] != oids[i - 1] or not in_base(parents[1]):
+            return "pending", 0
+    return states[reviewed]
+
+
+def pr_events(name, pr, now, in_base):
+    """[(kind, id, message, hint)] for one open PR: `behind` when it is ready but waits, `codex_slow` when Codex is late."""
+    number, head = int(pr["number"]), str(pr["headRefOid"])
+    commits = [node["commit"] for node in pr["commits"]["nodes"]]
+    if pr["isDraft"] or not HEX.fullmatch(head) or not commits or commits[-1]["oid"] != head:
+        return []
+    merge, rollup = pr["mergeStateStatus"], (commits[-1].get("statusCheckRollup") or {}).get("state")
+    ready = merge != "UNKNOWN" and rollup == "SUCCESS" and all(t["isResolved"] for t in pr["reviewThreads"]["nodes"])
+    old = now - datetime.fromisoformat(str(commits[-1]["committedDate"]).replace("Z", "+00:00")) > CODEX_SLOW
+    if not ready and not old:  # UNKNOWN: GitHub is still computing it, the next poll looks again
+        return []
+    state, _ = codex_state(pr, in_base)
+    events = []
+    if state == "pending" and old:
+        events.append(("codex_slow", f"codex:{number}:{head}:slow", f"Codex has not reviewed the head of PR #{number} after 30 min",
+                       f"gh pr view {number} --json reviews"))
+    if ready and state == "clean" and (merge == "BEHIND" or not pr["autoMergeRequest"]):
+        why = "behind base" if merge == "BEHIND" else "auto-merge off"
+        events.append(("behind", f"behind:{number}:{head}", f"PR #{number} is ready but {why}",
+                       f"gh pr view {number} --json mergeStateStatus,autoMergeRequest"))
+    return events
+
+
+def scan(repo, repos):
+    """The open PRs of a repo, read with one GraphQL query, as `behind` and `codex_slow` wakes; a log line."""
+    name = safe(repo, 200)
+    owner, _, short = name.partition("/")
+    status, headers, data = gh_get("graphql", fields=("-f", f"query={SCAN}", "-F", f"owner={owner}", "-F", f"name={short}"))
+    try:
+        prs = [pr for pr in data["data"]["repository"]["pullRequests"]["nodes"] if isinstance(pr, dict)]
+        now = email.utils.parsedate_to_datetime(headers["date"])  # GitHub's clock, never ours
+    except (KeyError, TypeError, ValueError):
+        return f"graphql: HTTP {status}"
+    counts, known = {"behind": 0, "codex_slow": 0}, {}
+
+    for pr in prs:
+        base = str(pr.get("baseRefName") or "")
+
+        def in_base(sha, base=base):
+            if (base, sha) not in known:  # compare base...sha is "behind" or "identical" when sha is in the base branch
+                status, _, diff = gh_get(f"repos/{name}/compare/{urllib.parse.quote(base, safe='')}...{safe(sha, 40)}")
+                known[base, sha] = status == 200 and isinstance(diff, dict) and diff.get("status") in ("behind", "identical")
+            return known[base, sha]
+        try:
+            events = pr_events(name, pr, now, in_base)
+        except (KeyError, TypeError, ValueError, AttributeError) as error:
+            print(f"scan {name}: skipped a malformed PR: {type(error).__name__}", flush=True)
+            continue
+        for kind, eid, message, hint in events:
+            try:
+                result = queue(name, repos[repo], eid, kind, message, hint, f"{safe(name)} #{pr['number']}: {kind}", pr.get("headRefName"), True)
+            except RuntimeError as error:
+                return f"{error}; the next poll tries again"
+            counts[kind] += result == "wake enqueued"
+    return f"{counts['behind']} behind, {counts['codex_slow']} codex slow queued from {len(prs)} open PRs"
+
+
 def reconcile_loop():
     while True:
         repos = load_repos()
         for repo in repos:
-            try:
-                print(f"reconcile {repo}: {reconcile(repo, repos)}", flush=True)
-            except Exception as error:  # one bad poll must not end the thread
-                print(f"reconcile {repo}: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
+            for step in (reconcile, scan):
+                try:
+                    print(f"{step.__name__} {repo}: {step(repo, repos)}", flush=True)
+                except Exception as error:  # one bad poll must not end the thread
+                    print(f"{step.__name__} {repo}: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
         time.sleep(RECONCILE_EVERY)
 
 

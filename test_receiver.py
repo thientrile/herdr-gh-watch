@@ -270,6 +270,166 @@ result = poll([])
 assert "gap 2026-09-01T00:00:00Z..2026-10-22T17:00:00Z" in result, result
 assert [g for g in gets if g[0].startswith("repos/acme/app/actions/runs")][0][0].endswith("2026-10-22T17%3A00%3A00Z")
 
+
+# v0.5.0: routing by kind. A 3rd repos.tsv column names the coordinator dir; without it nothing changes
+receiver.HERDR = fake_herdr
+open(fake_herdr, "w").write(f"#!/bin/sh\necho \"$*\" >> {checkout}/herdr-calls\n")
+coord = tempfile.mkdtemp()
+tsv = os.path.join(receiver.CONFIG, "repos.tsv")
+open(os.path.join(checkout, "mode"), "w").write("ok")
+
+
+def last(payload_event, payload, columns=2):
+    open(tsv, "w").write(f"acme/app\t{checkout}\t{coord}\n" if columns == 3 else f"acme/app\t{checkout}\n")
+    before = len(wake_calls())
+    result = receiver.handle(payload_event, payload, receiver.load_repos())
+    calls = wake_calls()[before:]
+    assert len(calls) <= 1, calls  # one enqueue per event, never a coordinator copy
+    if not calls:
+        return result, None
+    call = calls[0]
+    return result, {"id": call[call.index("--id") + 1], "kind": call[call.index("--kind") + 1], "cwd": call[call.index("--cwd") + 1],
+                    "text": call[call.index("--text") + 1], "branch": call[call.index("--branch") + 1] if "--branch" in call else None}
+
+
+head = {"ref": "feat/x", "sha": "a" * 40}
+pr_merged = {"action": "closed", "repository": repo, "pull_request": {"id": 77, "number": 7, "merged": True, "head": head}}
+assert last("pull_request", pr_merged)[1] == {"id": "pr:77:merged", "kind": "merged", "cwd": checkout,
+                                              "text": "PR #7 was merged in acme/app", "branch": "feat/x"}
+assert receiver.load_repos() == {"acme/app": (checkout, "")}
+assert last("pull_request", {**pr_merged, "pull_request": {**pr_merged["pull_request"], "id": 78}}, 3)[1] == \
+    {"id": "pr:78:merged", "kind": "merged", "cwd": coord, "text": "PR #7 was merged in acme/app", "branch": None}
+auto = {"action": "auto_merge_disabled", "repository": repo, "pull_request": {"id": 77, "number": 7, "head": head, "title": free_text}}
+_, got = last("pull_request", auto, 3)
+assert got == {"id": f"pr:77:auto_merge_disabled:{'a' * 40}", "kind": "auto_merge", "cwd": coord,
+               "text": "auto-merge disabled on PR #7 in acme/app", "branch": None}, got
+for state, where, branch in (("APPROVED", coord, None), ("CHANGES_REQUESTED", checkout, "feat/x"), ("COMMENTED", checkout, "feat/x")):
+    _, got = last("pull_request_review", {**attack, "review": {"id": 510 + len(state), "state": state, "body": free_text}}, 3)
+    assert (got["kind"], got["cwd"], got["branch"]) == ("review", where, branch), (state, got)
+ci = {"action": "completed", "repository": repo, "workflow_run": {"id": 950, "run_attempt": 1, "conclusion": "success",
+      "pull_requests": [{"number": 7}], "head_branch": "feat/x", "head_repository": {"full_name": "acme/app"}}}
+assert last("workflow_run", ci, 3)[1] == {"id": "run:950:1", "kind": "ci_success", "cwd": coord,
+                                          "text": "CI finished (success) for PR #7 in acme/app", "branch": None}
+_, got = last("workflow_run", {**ci, "workflow_run": {**ci["workflow_run"], "id": 951, "conclusion": "failure"}}, 3)
+assert (got["kind"], got["cwd"], got["branch"]) == ("ci_failure", checkout, "feat/x")
+_, got = last("issue_comment", {**comment, "comment": {"id": 602, "body": free_text}}, 3)
+assert (got["kind"], got["cwd"]) == ("comment", checkout)
+
+# Codex: its fixed receipt is clean (coordinator), its review is findings(n) (thread); inline comments and the summary wake nobody
+bot = {"login": "chatgpt-codex-connector[bot]"}
+receipt = "<!-- codex-review-receipt:v1 -->\nCodex Review: Didn't find any major issues. PWNED $(id)\n**Reviewed commit:** `aaaaaaaaaa`"
+_, got = last("issue_comment", {**comment, "sender": bot, "comment": {"id": 603, "body": receipt}}, 3)
+assert got == {"id": "comment:603", "kind": "codex_clean", "cwd": coord, "text": "Codex found no major issues on PR #7 in acme/app",
+               "branch": None}, got
+assert last("issue_comment", {**comment, "comment": {"id": 604, "body": receipt}}, 3)[1]["kind"] == "comment"  # a human quoting it
+answers["pulls"] = [{"id": 1}, {"id": 2}, {"id": 3}]  # the review's inline comments
+calls[:] = []
+_, got = last("pull_request_review", {**attack, "sender": bot, "review": {"id": 520, "state": "COMMENTED", "body": free_text}}, 3)
+assert got == {"id": "review:520", "kind": "codex_findings", "cwd": checkout, "text": "Codex findings (3) on PR #7 in acme/app",
+               "branch": "feat/x"}, got
+assert calls == ["repos/acme/app/pulls/7/reviews/520/comments?per_page=100"], calls
+inline = {"action": "created", "repository": repo, "sender": bot, "pull_request": {"number": 7}, "comment": {"id": 605, "body": free_text}}
+assert last("pull_request_review_comment", inline, 3) == ("ignored (codex)", None)
+summary_body = '<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {"code_review": {}} -->'
+assert last("issue_comment", {**comment, "sender": bot, "comment": {"id": 606, "body": summary_body}}, 3) == ("ignored (codex)", None)
+assert all(free_text not in arg and "PWNED" not in arg for call in wake_calls() for arg in call)
+
+# the scan: one GraphQL query per repo per poll gives `behind` and `codex_slow`
+NOW, A, B, M, M2 = "Thu, 29 Oct 2026 17:00:00 GMT", "a" * 40, "b" * 40, "c" * 40, "d" * 40
+scan_data, base_shas, scan_gets = {}, {"e" * 40}, []
+
+
+def commit(oid, parents, at="2026-10-29T15:00:00Z", rollup="SUCCESS"):
+    return {"commit": {"oid": oid, "committedDate": at, "parents": {"nodes": [{"oid": p} for p in parents]},
+                       "statusCheckRollup": {"state": rollup}}}
+
+
+def summary(sha, findings=False, status="completed"):
+    state = {"code_review": {"commit_sha": sha, "has_any_findings": findings, "has_unresolved_findings": findings, "status": status}}
+    return {"author": {"login": "chatgpt-codex-connector"}, "body": f"<!-- codex-pull-request-review-summary -->\n"
+            f"<!-- codex-review-state:v1 {json.dumps(state)} -->\n## Codex Review Summary"}
+
+
+def open_pr(number=7, merge="BEHIND", auto=True, commits=None, comments=(), reviews=(), threads=(True,), draft=False):
+    commits = commits or [commit(A, ["0" * 40])]
+    return {"number": number, "isDraft": draft, "mergeStateStatus": merge, "headRefOid": commits[-1]["commit"]["oid"],
+            "headRefName": "feat/x", "baseRefName": "main", "autoMergeRequest": {"enabledAt": "x"} if auto else None,
+            "commits": {"nodes": commits}, "reviewThreads": {"nodes": [{"isResolved": r} for r in threads]},
+            "reviews": {"nodes": list(reviews)}, "comments": {"nodes": list(comments)}}
+
+
+def scan_get(path, etag="", fields=()):
+    scan_gets.append(path)
+    if path == "graphql":
+        return 200, {"date": NOW}, {"data": {"repository": {"pullRequests": {"nodes": scan_data["prs"]}}}}
+    sha = path.rsplit("...", 1)[1]
+    return 200, {}, {"status": "behind" if sha in base_shas else "diverged"}
+
+
+def scanned(*prs, columns=3):
+    open(tsv, "w").write(f"acme/app\t{checkout}\t{coord}\n" if columns == 3 else f"acme/app\t{checkout}\n")
+    scan_data["prs"], scan_gets[:] = list(prs), []
+    before = len(wake_calls())
+    line = receiver.scan("acme/app", receiver.load_repos())
+    out = [(c[c.index("--id") + 1], c[c.index("--kind") + 1], c[c.index("--cwd") + 1], c[c.index("--text") + 1], "--branch" in c)
+           for c in wake_calls()[before:]]
+    return line, out
+
+
+receiver.gh_get = scan_get
+clean = [summary(A)]
+line, out = scanned(open_pr(comments=clean))
+assert out == [(f"behind:7:{A}", "behind", coord, "PR #7 is ready but behind base in acme/app", False)], out
+assert line == "1 behind, 0 codex slow queued from 1 open PRs", line
+assert scanned(open_pr(number=8, merge="CLEAN", auto=False, comments=clean))[1][0][3] == "PR #8 is ready but auto-merge off in acme/app"
+assert scanned(open_pr(number=9, merge="CLEAN", auto=True, comments=clean))[1] == []  # auto-merge on and up to date: it merges itself
+assert scanned(open_pr(number=10, merge="UNKNOWN", comments=clean))[1] == []  # GitHub still computing: next poll
+assert scanned(open_pr(number=11, threads=(True, False), comments=clean))[1] == []  # an unresolved thread
+assert scanned(open_pr(number=12, commits=[commit(A, ["0" * 40], rollup="PENDING")], comments=clean))[1] == []
+assert scanned(open_pr(number=13, comments=[summary(A, findings=True)]))[1] == []  # findings: not ready
+assert scanned(open_pr(number=14, draft=True, comments=clean))[1] == []
+assert [o[1] for o in scanned(open_pr(number=15, comments=[summary(B)]))[1]] == ["codex_slow"]  # Codex reviewed another commit
+_, out = scanned(open_pr(number=16, comments=clean), columns=2)
+assert out == [(f"behind:16:{A}", "behind", checkout, "PR #16 is ready but behind base in acme/app", True)], out  # no coord: the thread
+assert scanned(open_pr(number=16, comments=clean))[1][0][0] == f"behind:16:{A}"  # same id: wake stores it once
+
+# update-branch merges after the reviewed commit keep it clean; a merge of anything else does not
+merged_head = [commit(A, ["0" * 40]), commit(M, [A, "e" * 40], at="2026-10-29T16:59:00Z"),
+               commit(M2, [M, "e" * 40], at="2026-10-29T16:59:30Z")]
+_, out = scanned(open_pr(number=17, commits=merged_head, comments=clean))
+assert out == [(f"behind:17:{M2}", "behind", coord, "PR #17 is ready but behind base in acme/app", False)], out
+assert any(g.startswith("repos/acme/app/compare/main...") for g in scan_gets)
+foreign = [commit(A, ["0" * 40]), commit(M, [A, "f" * 40], at="2026-10-29T16:59:00Z")]
+assert scanned(open_pr(number=18, commits=foreign, comments=clean))[1] == []
+not_merge = [commit(A, ["0" * 40]), commit(B, [A], at="2026-10-29T16:59:00Z")]
+assert scanned(open_pr(number=19, commits=not_merge, comments=clean))[1] == []
+
+# receipt fallback (no summary), the 10-char sha matched against the PR's commits; a findings review of the same commit wins
+receipt_comment = {"author": {"login": "chatgpt-codex-connector"}, "body": receipt}
+assert scanned(open_pr(number=20, comments=[receipt_comment]))[1][0][0] == f"behind:20:{A}"
+findings_review = {"author": {"login": "chatgpt-codex-connector"}, "body": "x", "commit": {"oid": A}, "comments": {"totalCount": 2}}
+assert receiver.codex_state(open_pr(reviews=[findings_review], comments=[receipt_comment]), None) == ("findings", 2)
+assert receiver.codex_state(open_pr(reviews=[findings_review]), None) == ("findings", 2)
+assert receiver.codex_state(open_pr(comments=[summary(A, status="in_progress")]), None) == ("pending", 0)
+assert receiver.codex_state(open_pr(comments=[{**receipt_comment, "author": {"login": "someone"}}]), None) == ("pending", 0)
+
+# codex_slow: head older than 30 min with no Codex review; never on update-branch merges after a review
+_, out = scanned(open_pr(number=21, merge="BLOCKED", commits=[commit(A, ["0" * 40], at="2026-10-29T16:29:00Z")]))
+assert out == [(f"codex:21:{A}:slow", "codex_slow", coord, "Codex has not reviewed the head of PR #21 after 30 min in acme/app", False)]
+assert scanned(open_pr(number=22, merge="BLOCKED", commits=[commit(A, ["0" * 40], at="2026-10-29T16:31:00Z")]))[1] == []
+late_merges = [commit(A, ["0" * 40]), commit(M, [A, "e" * 40], at="2026-10-29T16:00:00Z")]
+assert scanned(open_pr(number=23, merge="BLOCKED", commits=late_merges, comments=clean))[1] == []
+assert scanned(open_pr(number=24, merge="BLOCKED", commits=late_merges, reviews=[findings_review]))[1] == []
+
+# malformed data and a failed query only log; a failed enqueue stops the scan for the next poll
+assert scanned({"number": "x"}, open_pr(number=25, comments=clean))[1][0][0] == f"behind:25:{A}"
+receiver.gh_get = lambda path, etag="", fields=(): (502, {}, None)
+assert receiver.scan("acme/app", receiver.load_repos()) == "graphql: HTTP 502"
+receiver.gh_get = scan_get
+open(os.path.join(checkout, "mode"), "w").write("1")
+assert "next poll" in scanned(open_pr(number=26, comments=clean))[0]
+open(os.path.join(checkout, "mode"), "w").write("ok")
+
 receiver.HERDR_TIMEOUT = 1
 for mode in ("exit 1", "sleep 3"):  # every herdr call checks exit code, timeout and a missing binary
     open(fake_herdr, "w").write(f"#!/bin/sh\n{mode}\n")
