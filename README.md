@@ -107,7 +107,7 @@ Each result is shaped like its webhook and goes through the same path as a live 
 - **At most 20 new wakes per repo per poll** from the events, and 20 from the PR scan; the rest are logged and picked up by the next poll.
 - Results show in `receiver.log` as `reconcile owner/repo: ...` and `scan owner/repo: N behind, M codex slow queued from K open PRs`.
 
-Limits: the events feed lags behind real time by about 30 seconds to 6 hours and holds only the last 300 events, so an event that shows up in the feed more than an hour after it happened, or that falls out of a busy feed, is missed. Only the newest 100 CI runs per poll are read (the log says how many older ones were skipped). CI runs are matched by when they were created, so a re-run of an old run, or a run that finishes long after it started, can be missed. For anything missed, open the webhook's Recent Deliveries in the repo settings and press **Redeliver**.
+Limits: the events feed lags behind real time by about 30 seconds to 6 hours and holds only the last 300 events, so an event that shows up in the feed more than an hour after it happened, or that falls out of a busy feed, is missed (when a poll reads all 300 and they are all inside its window, the log says `feed limit 300 reached, events before <time> not read`). Only the newest 100 CI runs per poll are read (the log says how many older ones were skipped). CI runs are matched by when they were created, so a re-run of an old run, or a run that finishes long after it started, can be missed. For anything missed, open the webhook's Recent Deliveries in the repo settings and press **Redeliver**.
 
 ## Expose the receiver
 
