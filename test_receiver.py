@@ -328,19 +328,17 @@ tsv = os.path.join(receiver.CONFIG, "repos.tsv")
 open(os.path.join(checkout, "mode"), "w").write("ok")
 
 
-copies = []  # the coordinator copies of the last event, parsed like the main call
-
-
 def last(payload_event, payload, columns=2):
     open(tsv, "w").write(f"acme/app\t{checkout}\t{coord}\n" if columns == 3 else f"acme/app\t{checkout}\n")
     before = len(wake_calls())
     result = receiver.handle(payload_event, payload, receiver.load_repos())
     calls = wake_calls()[before:]
-    assert len(calls) <= 2, calls  # one enqueue per event, plus a coordinator copy for COPY_KINDS
-    parsed = [{"id": c[c.index("--id") + 1], "kind": c[c.index("--kind") + 1], "cwd": c[c.index("--cwd") + 1],
-               "text": c[c.index("--text") + 1], "branch": c[c.index("--branch") + 1] if "--branch" in c else None} for c in calls]
-    copies[:] = parsed[1:]
-    return result, parsed[0] if parsed else None
+    assert len(calls) <= 1, calls  # one enqueue per event, never a coordinator copy
+    if not calls:
+        return result, None
+    call = calls[0]
+    return result, {"id": call[call.index("--id") + 1], "kind": call[call.index("--kind") + 1], "cwd": call[call.index("--cwd") + 1],
+                    "text": call[call.index("--text") + 1], "branch": call[call.index("--branch") + 1] if "--branch" in call else None}
 
 
 head = {"ref": "feat/x", "sha": "a" * 40}
@@ -363,10 +361,9 @@ assert last("workflow_run", ci, 3)[1] == {"id": "run:950:1", "kind": "ci_success
                                           "text": "CI finished (success) for PR #7 in acme/app", "branch": None}
 _, got = last("workflow_run", {**ci, "workflow_run": {**ci["workflow_run"], "id": 951, "conclusion": "failure"}}, 3)
 assert (got["kind"], got["cwd"], got["branch"]) == ("ci_failure", checkout, "feat/x")
-# the coordinator hears about a failure too, under its own id: the thread fixes it, the coordinator knows it happened
-assert copies == [{**got, "id": "run:951:1:coord", "cwd": coord, "branch": None}], copies
-_, got = last("workflow_run", {**ci, "workflow_run": {**ci["workflow_run"], "id": 952, "conclusion": "failure"}})
-assert got["cwd"] == checkout and copies == []  # no coordinator in repos.tsv: no copy
+before = len(wake_calls())  # owner decision 2026-10-31: a failure goes to the thread only, never a coordinator copy
+receiver.handle("workflow_run", {**ci, "workflow_run": {**ci["workflow_run"], "id": 953, "conclusion": "failure"}}, receiver.load_repos())
+assert [c[c.index("--cwd") + 1] for c in wake_calls()[before:]] == [checkout]
 _, got = last("issue_comment", {**comment, "comment": {"id": 602, "body": free_text}}, 3)
 assert (got["kind"], got["cwd"]) == ("comment", checkout)
 
@@ -382,7 +379,6 @@ calls[:] = []
 _, got = last("pull_request_review", {**attack, "sender": bot, "review": {"id": 520, "state": "COMMENTED", "body": free_text}}, 3)
 assert got == {"id": "review:520", "kind": "codex_findings", "cwd": checkout, "text": "Codex findings (3) on PR #7 in acme/app",
                "branch": "feat/x"}, got
-assert copies == [{**got, "id": "review:520:coord", "cwd": coord, "branch": None}], copies
 assert calls == ["repos/acme/app/pulls/7/reviews/520/comments?per_page=100"], calls
 inline = {"action": "created", "repository": repo, "sender": bot, "pull_request": {"number": 7}, "comment": {"id": 605, "body": free_text}}
 assert last("pull_request_review_comment", inline, 3) == ("ignored (codex)", None)
