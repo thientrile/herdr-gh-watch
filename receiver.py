@@ -52,6 +52,7 @@ CODEX_CLEAN = "Didn't find any major issues"  # Codex's fixed clean receipt: mat
 CODEX_STATE = re.compile(r"<!-- codex-review-state:v1 (\{.*?\}) -->")
 CODEX_SLOW = timedelta(minutes=30)
 # events the project coordinator acts on (merge, update-branch, auto-merge); the rest go to the branch's thread
+COPY_KINDS = {"ci_failure", "codex_findings"}  # go to the thread, and a copy to the coordinator so it knows
 COORD_KINDS = {"merged", "behind", "auto_merge", "ci_success", "codex_clean", "codex_slow"}  # and approved reviews
 
 
@@ -265,10 +266,14 @@ def handle(event, payload, repos):
         kind = {"pull_request_review": "review", "pull_request": "merged" if payload.get("action") == "closed" else "auto_merge"}.get(event, "comment")
         hint = f"gh pr view {number} --comments"
     approved = kind == "review" and str(payload["review"].get("state", "")).lower() == "approved"
-    return queue(repo, local, event_id(event, payload), kind, message, hint, title, head, kind in COORD_KINDS or approved)
+    eid = event_id(event, payload)
+    result = queue(repo, local, eid, kind, message, hint, title, head, kind in COORD_KINDS or approved)
+    if kind in COPY_KINDS and local[1]:  # its own id, so wake keeps both; a failure raises and GitHub redelivers
+        queue(repo, local, f"{eid}:coord", kind, message, hint, title, head, True, announce=False)
+    return result
 
 
-def queue(repo, entry, eid, kind, message, hint, title, head, coordinator):
+def queue(repo, entry, eid, kind, message, hint, title, head, coordinator, announce=True):
     """One `wake enqueue`: to the coordinator dir without --branch when repos.tsv names one, else to the checkout on the PR branch."""
     local, coord = entry
     coord = coord if coordinator else ""
@@ -281,7 +286,7 @@ def queue(repo, entry, eid, kind, message, hint, title, head, coordinator):
     except RuntimeError:
         threading.Thread(target=notify_user, args=(f"{title} (not queued for the agent)",), daemon=True).start()
         raise
-    if status != "duplicate":  # a redelivery or a reconciled copy was already announced
+    if status != "duplicate" and announce:  # a redelivery or a reconciled copy was already announced
         threading.Thread(target=notify_user, args=(title,), daemon=True).start()
     return f"wake {status}"
 
