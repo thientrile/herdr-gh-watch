@@ -474,6 +474,9 @@ assert scanned(open_pr(number=27, comments=clean, extra_threads=1))[1] == []  # 
 _, out = scanned(open_pr(number=21, merge="BLOCKED", commits=[commit(A, ["0" * 40], at="2026-10-29T16:29:00Z")]))
 assert out == [(f"codex:21:{A}:slow", "codex_slow", coord, "Codex has not reviewed the head of PR #21 after 30 min in acme/app", False)]
 assert scanned(open_pr(number=22, merge="BLOCKED", commits=[commit(A, ["0" * 40], at="2026-10-29T16:31:00Z")]))[1] == []
+assert [o[1] for o in scanned(open_pr(number=28, merge="BLOCKED", commits=[commit(A, ["0" * 40], at="2026-10-29T16:00:00Z")]))[1]] == ["codex_slow"]
+# past CODEX_SLOW_MAX the warning means nothing any more: a 10-day-old head nobody asked Codex about is not news
+assert scanned(open_pr(number=29, merge="BLOCKED", commits=[commit(A, ["0" * 40], at="2026-10-19T17:00:00Z")]))[1] == []
 late_merges = [commit(A, ["0" * 40]), commit(M, [A, "e" * 40], at="2026-10-29T16:00:00Z")]
 assert scanned(open_pr(number=23, merge="BLOCKED", commits=late_merges, comments=clean))[1] == []
 assert scanned(open_pr(number=24, merge="BLOCKED", commits=late_merges, reviews=[findings_review]))[1] == []
