@@ -361,6 +361,9 @@ assert last("workflow_run", ci, 3)[1] == {"id": "run:950:1", "kind": "ci_success
                                           "text": "CI finished (success) for PR #7 in acme/app", "branch": None}
 _, got = last("workflow_run", {**ci, "workflow_run": {**ci["workflow_run"], "id": 951, "conclusion": "failure"}}, 3)
 assert (got["kind"], got["cwd"], got["branch"]) == ("ci_failure", checkout, "feat/x")
+before = len(wake_calls())  # owner decision 2026-10-31: a failure goes to the thread only, never a coordinator copy
+receiver.handle("workflow_run", {**ci, "workflow_run": {**ci["workflow_run"], "id": 953, "conclusion": "failure"}}, receiver.load_repos())
+assert [c[c.index("--cwd") + 1] for c in wake_calls()[before:]] == [checkout]
 _, got = last("issue_comment", {**comment, "comment": {"id": 602, "body": free_text}}, 3)
 assert (got["kind"], got["cwd"]) == ("comment", checkout)
 
