@@ -51,6 +51,7 @@ CODEX_BOT = "chatgpt-codex-connector[bot]"  # REST login; GraphQL drops the "[bo
 CODEX_CLEAN = "Didn't find any major issues"  # Codex's fixed clean receipt: matched, never forwarded
 CODEX_STATE = re.compile(r"<!-- codex-review-state:v1 (\{.*?\}) -->")
 CODEX_SLOW = timedelta(minutes=30)
+CODEX_SLOW_MAX = timedelta(hours=6)  # an older head with no review was never sent to Codex: a warning would be noise
 # events the project coordinator acts on (merge, update-branch, auto-merge); the rest go to the branch's thread
 COORD_KINDS = {"merged", "behind", "auto_merge", "ci_success", "codex_clean", "codex_slow"}  # and approved reviews
 
@@ -497,7 +498,8 @@ def pr_events(name, pr, now, in_base):
     threads = pr["reviewThreads"]  # past the first 100 the rest are unknown: not ready
     ready = merge in ("BEHIND", "CLEAN", "HAS_HOOKS", "UNSTABLE") and rollup == "SUCCESS" and \
         threads["totalCount"] <= len(threads["nodes"]) and all(t["isResolved"] for t in threads["nodes"])
-    old = now - datetime.fromisoformat(str(commits[-1]["committedDate"]).replace("Z", "+00:00")) > CODEX_SLOW
+    age = now - datetime.fromisoformat(str(commits[-1]["committedDate"]).replace("Z", "+00:00"))
+    old = CODEX_SLOW < age < CODEX_SLOW_MAX
     if not ready and not old:
         return []
     state, _ = codex_state(pr, in_base)
