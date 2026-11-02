@@ -396,6 +396,9 @@ def reconcile(repo, repos):
             entries = [e for e in feed if isinstance(e, dict) and str(e.get("created_at", "")) >= since]
             items += [item for item in map(lambda e: from_feed(name, e), entries) if item]
             if not entries or len(feed) < 100 or page == 3:  # not sorted strictly by time; it holds 300 events
+                end = page == 3 and len(feed) == 100 and isinstance(feed[-1], dict) and str(feed[-1].get("created_at", ""))
+                if end and end >= since:  # the window goes on past what GitHub keeps
+                    note += f"; feed limit 300 reached, events before {re.sub(r"[^0-9TZ:-]", "", end)[:20]} not read"
                 break
             page += 1
             status, _, feed = gh_get(f"repos/{name}/events?per_page=100&page={page}")

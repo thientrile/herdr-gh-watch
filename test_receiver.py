@@ -302,6 +302,17 @@ poll(None, runs=[{**run_base, "id": 901, "run_attempt": 1}], status=304)
 assert gets[0] == ("repos/acme/app/events?per_page=100", 'W/"e9"') and wake_calls()[-1][wake_calls()[-1].index("--id") + 1] == "run:901:1"
 assert json.load(open(cursor_file))["etag"] == 'W/"e9"'
 
+# three full pages still inside the window: the 300-event feed limit is reached, older events are unread and the log says so
+star = lambda at: {"type": "WatchEvent", "created_at": at, "actor": {"login": "x"}, "payload": {}}  # wakes nobody
+routes["repos/acme/app/events#2"] = (200, {}, [star("2026-10-29T16:58:00Z")] * 100)
+routes["repos/acme/app/events#3"] = (200, {}, [star("2026-10-29T16:57:00Z")] * 100)
+result = poll([star("2026-10-29T16:59:00Z")] * 100)
+assert result.endswith("; feed limit 300 reached, events before 2026-10-29T16:57:00Z not read"), result
+routes["repos/acme/app/events#3"] = (200, {}, [star("2026-10-29T16:57:00Z")] * 99 + [star("2026-10-01T00:00:00Z")])
+assert "feed limit" not in poll([star("2026-10-29T16:59:00Z")] * 100)  # the window ends inside the feed: nothing lost
+del routes["repos/acme/app/events#2"], routes["repos/acme/app/events#3"]
+poll([])
+
 # MAX_LOOKBACK: an old cursor reads 7 days back and says what it skipped
 json.dump({"cursor": "2026-09-01T00:00:00Z"}, open(cursor_file, "w"))
 result = poll([])
