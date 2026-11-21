@@ -384,6 +384,35 @@ inline = {"action": "created", "repository": repo, "sender": bot, "pull_request"
 assert last("pull_request_review_comment", inline, 3) == ("ignored (codex)", None)
 summary_body = '<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {"code_review": {}} -->'
 assert last("issue_comment", {**comment, "sender": bot, "comment": {"id": 606, "body": summary_body}}, 3) == ("ignored (codex)", None)
+
+# v0.5.3: Codex signals with its summary comment only, created then edited in place; the id is per PR and commit
+def summary_event(sha, findings=False, status="completed", action="created", sender=bot, raw=None):
+    state = {"code_review": {"commit_sha": sha, "has_any_findings": findings, "has_unresolved_findings": findings, "status": status}}
+    body = f"<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {raw or json.dumps(state)} -->\nPWNED $(id)"
+    return {**comment, "action": action, "sender": sender, "comment": {"id": 607, "body": body}}
+
+
+S1, S2 = "1" * 40, "2" * 40
+result, got = last("issue_comment", summary_event(S1), 3)
+assert (result, got) == ("wake enqueued", {"id": f"codex:7:{S1}:clean", "kind": "codex_clean", "cwd": coord,
+                                           "text": "Codex found no major issues on PR #7 in acme/app", "branch": None}), (result, got)
+result, got = last("issue_comment", summary_event(S1, action="edited"), 3)
+assert result == "wake duplicate" and got["id"] == f"codex:7:{S1}:clean", (result, got)  # an edit at the same commit
+result, got = last("issue_comment", summary_event(S2, findings=True, action="edited"), 3)
+assert (got["id"], got["kind"], got["cwd"], got["branch"]) == (f"codex:7:{S2}:findings", "codex_findings", checkout, None), got  # an issue comment names no branch
+assert got["text"] == "Codex findings (?) on PR #7 in acme/app", got
+for status in ("pending", "in_progress", None):
+    assert last("issue_comment", summary_event(S1, status=status), 3) == ("ignored (codex)", None), status
+for raw in ('{"code_review": ', '"x"', '{"code_review": []}', '{"code_review": {"commit_sha": "zz", "status": "completed", "has_any_findings": false}}',
+            '{"code_review": {"commit_sha": "%s", "status": "completed"}}' % S1):  # bad JSON, wrong shape, bad sha, a missing field
+    assert last("issue_comment", summary_event(S1, raw=raw, action="edited"), 3) == ("ignored (codex)", None), raw
+assert last("issue_comment", summary_event(S1, action="edited", sender={"login": "someone"}), 3) == ("ignored", None)
+assert last("issue_comment", {**comment, "action": "edited", "comment": {"id": 608, "body": free_text}}, 3) == ("ignored", None)
+# Codex's findings review shares the summary's id when it names its commit, so one round wakes the thread once
+calls[:] = []
+_, got = last("pull_request_review", {**attack, "sender": bot, "review": {"id": 521, "commit_id": S2, "state": "COMMENTED", "body": "x"}}, 3)
+assert got["id"] == f"codex:7:{S2}:findings", got
+assert all(free_text not in arg and "PWNED" not in arg for call in wake_calls() for arg in call)
 assert all(free_text not in arg and "PWNED" not in arg for call in wake_calls() for arg in call)
 
 # the scan: one GraphQL query per repo per poll gives `behind` and `codex_slow`
@@ -422,21 +451,21 @@ def scan_get(path, etag="", fields=()):
     return 200, {}, {"status": "behind" if sha in base_shas else "diverged"}
 
 
-def scanned(*prs, columns=3):
+def scanned(*prs, columns=3, keep_clean=False):
     open(tsv, "w").write(f"acme/app\t{checkout}\t{coord}\n" if columns == 3 else f"acme/app\t{checkout}\n")
     scan_data["prs"], scan_gets[:] = list(prs), []
     before = len(wake_calls())
     line = receiver.scan("acme/app", receiver.load_repos())
     out = [(c[c.index("--id") + 1], c[c.index("--kind") + 1], c[c.index("--cwd") + 1], c[c.index("--text") + 1], "--branch" in c)
            for c in wake_calls()[before:]]
-    return line, out
+    return line, [o for o in out if keep_clean or o[1] != "codex_clean"]  # most cases test behind and codex_slow
 
 
 receiver.gh_get = scan_get
 clean = [summary(A)]
 line, out = scanned(open_pr(comments=clean))
 assert out == [(f"behind:7:{A}", "behind", coord, "PR #7 is ready but behind base in acme/app", False)], out
-assert line == "1 behind, 0 codex slow queued from 1 open PRs", line
+assert line == "1 behind, 0 codex slow, 1 codex clean queued from 1 open PRs", line
 assert scanned(open_pr(number=8, merge="CLEAN", auto=False, comments=clean))[1][0][3] == "PR #8 is ready but auto-merge off in acme/app"
 assert scanned(open_pr(number=9, merge="CLEAN", auto=True, comments=clean))[1] == []  # auto-merge on and up to date: it merges itself
 assert scanned(open_pr(number=10, merge="UNKNOWN", comments=clean))[1] == []  # GitHub still computing: next poll
@@ -450,6 +479,18 @@ assert [o[1] for o in scanned(open_pr(number=15, comments=[summary(B)]))[1]] == 
 _, out = scanned(open_pr(number=16, comments=clean), columns=2)
 assert out == [(f"behind:16:{A}", "behind", checkout, "PR #16 is ready but behind base in acme/app", True)], out  # no coord: the thread
 assert scanned(open_pr(number=16, comments=clean))[1][0][0] == f"behind:16:{A}"  # same id: wake stores it once
+
+# v0.5.3: the scan is the safety net for summary edits (the events feed carries no edited comments): codex_clean once
+line, out = scanned(open_pr(number=30, merge="BLOCKED", comments=clean), keep_clean=True)
+assert out == [(f"codex:30:{A}:clean", "codex_clean", coord, "Codex found no major issues on PR #30 in acme/app", False)], out
+assert line == "0 behind, 0 codex slow, 1 codex clean queued from 1 open PRs", line
+assert scanned(open_pr(number=30, merge="BLOCKED", comments=clean), keep_clean=True)[0].endswith("0 codex clean queued from 1 open PRs")
+assert scanned(open_pr(number=31, merge="BLOCKED", comments=[summary(A, findings=True)]), keep_clean=True)[1] == []
+assert [o[1] for o in scanned(open_pr(number=32, merge="BLOCKED", comments=[summary(A, status="in_progress")]), keep_clean=True)[1]] == ["codex_slow"]
+old_clean = [commit(A, ["0" * 40], at="2026-10-29T10:00:00Z")]  # older than CODEX_SLOW_MAX: no wake for long-settled PRs
+assert scanned(open_pr(number=33, merge="BLOCKED", commits=old_clean, comments=clean), keep_clean=True)[1] == []
+bad = {"author": {"login": "chatgpt-codex-connector"}, "body": "<!-- codex-review-state:v1 {not json} -->"}
+assert [o[1] for o in scanned(open_pr(number=34, merge="BLOCKED", comments=[bad]), keep_clean=True)[1]] == ["codex_slow"]  # bad JSON: pending, no crash
 
 # update-branch merges after the reviewed commit keep it clean; a merge of anything else does not
 merged_head = [commit(A, ["0" * 40]), commit(M, [A, "e" * 40], at="2026-10-29T16:59:00Z"),
@@ -470,18 +511,18 @@ assert scanned(open_pr(number=19, commits=not_merge, comments=clean))[1] == []
 receipt_comment = {"author": {"login": "chatgpt-codex-connector"}, "body": receipt}
 assert scanned(open_pr(number=20, comments=[receipt_comment]))[1][0][0] == f"behind:20:{A}"
 findings_review = {"author": {"login": "chatgpt-codex-connector"}, "body": "x", "commit": {"oid": A}, "comments": {"totalCount": 2}}
-assert receiver.codex_state(open_pr(reviews=[findings_review], comments=[receipt_comment]), None) == ("findings", 2)
-assert receiver.codex_state(open_pr(reviews=[findings_review]), None) == ("findings", 2)
-assert receiver.codex_state(open_pr(comments=[summary(A, status="in_progress")]), None) == ("pending", 0)
-assert receiver.codex_state(open_pr(comments=[{**receipt_comment, "author": {"login": "someone"}}]), None) == ("pending", 0)
+assert receiver.codex_state(open_pr(reviews=[findings_review], comments=[receipt_comment]), None)[:2] == ("findings", 2)
+assert receiver.codex_state(open_pr(reviews=[findings_review]), None)[:2] == ("findings", 2)
+assert receiver.codex_state(open_pr(comments=[summary(A, status="in_progress")]), None)[:2] == ("pending", 0)
+assert receiver.codex_state(open_pr(comments=[{**receipt_comment, "author": {"login": "someone"}}]), None)[:2] == ("pending", 0)
 
 # an older summary does not hide a newer review or receipt; the summary wins only for its own commit
 two = [commit(A, ["0" * 40]), commit(B, [A])]
 findings_b = {**findings_review, "commit": {"oid": B}}
-assert receiver.codex_state(open_pr(commits=two, reviews=[findings_b], comments=clean), None) == ("findings", 2)
+assert receiver.codex_state(open_pr(commits=two, reviews=[findings_b], comments=clean), None)[:2] == ("findings", 2)
 receipt_b = {**receipt_comment, "body": receipt.replace("aaaaaaaaaa", "bbbbbbbbbb")}
-assert receiver.codex_state(open_pr(commits=two, comments=[summary(A, findings=True), receipt_b]), None) == ("clean", 0)
-assert receiver.codex_state(open_pr(reviews=[findings_review], comments=clean), None) == ("clean", 0)  # same commit: summary
+assert receiver.codex_state(open_pr(commits=two, comments=[summary(A, findings=True), receipt_b]), None)[:2] == ("clean", 0)
+assert receiver.codex_state(open_pr(reviews=[findings_review], comments=clean), None)[:2] == ("clean", 0)  # same commit: summary
 assert scanned(open_pr(number=27, comments=clean, extra_threads=1))[1] == []  # 101 threads: the unread one may be unresolved
 
 # codex_slow: head older than 30 min with no Codex review; never on update-branch merges after a review
@@ -496,7 +537,7 @@ assert scanned(open_pr(number=23, merge="BLOCKED", commits=late_merges, comments
 assert scanned(open_pr(number=24, merge="BLOCKED", commits=late_merges, reviews=[findings_review]))[1] == []
 
 # the cap: at most RECONCILE_CAP new wakes per scan, duplicates do not count, the next poll queues the rest
-many = [open_pr(number=100 + i, comments=clean) for i in range(25)]
+many = [open_pr(number=100 + i, comments=clean, commits=old_clean) for i in range(25)]  # behind only
 line, out = scanned(*many)
 assert len(out) == 20 and "cap 20 reached" in line, line
 assert len(scanned(*many)[1]) == 25  # 20 duplicates, then the last 5
@@ -531,6 +572,54 @@ workers = [threading.Thread(target=lambda: claims.append(receiver.claim_review("
 [w.start() for w in workers]
 [w.join() for w in workers]
 assert sorted(claims) == [False] * 7 + [True], claims
+
+# v0.5.3: a failed second review releases its claim, is retried once, logs one line and notifies; a posted one keeps it
+import contextlib  # noqa: E402
+import io  # noqa: E402
+review_bin = tempfile.mkdtemp()
+open(os.path.join(review_bin, "gh"), "w").write(f"#!/bin/sh\necho \"$*\" >> {review_bin}/gh-calls\n"
+                                                 "[ \"$2\" = diff ] && echo 'diff --git a/x b/x'\nexit 0\n")
+open(os.path.join(review_bin, "reviewer"), "w").write(f"#!/bin/sh\necho x >> {review_bin}/runs\n"
+                                                       f"[ -f {review_bin}/ok ] && {{ echo 'No findings.'; exit 0; }}\nsleep 3\n")
+[os.chmod(os.path.join(review_bin, f), 0o755) for f in ("gh", "reviewer")]
+open(os.path.join(receiver.CONFIG, "review_cmd"), "w").write(f"{review_bin}/reviewer\n")
+os.environ["PATH"] = review_bin + ":" + os.environ["PATH"]
+receiver.HERDR, receiver.REVIEW_TIMEOUT = fake_herdr, 1
+open(fake_herdr, "w").write(f"#!/bin/sh\necho \"$*\" >> {checkout}/herdr-calls\n")
+open(os.path.join(checkout, "herdr-calls"), "w").close()
+
+
+def review_round(number):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        receiver.review_round("acme/app", number, receiver.claim_review("acme/app", number), True)
+    return out.getvalue().splitlines(), json.load(open(os.path.join(receiver.STATE, "reviews.json")))[f"acme/app#{number}"]
+
+
+lines, kept = review_round(40)  # times out twice: given up, recorded, never claimed again
+assert lines == ["review acme/app#40: failed (timeout 1s)"] * 2, lines
+assert kept == {"failed": 2} and receiver.claim_review("acme/app", 40) is False, kept
+assert len(open(os.path.join(review_bin, "runs")).read().split()) == 2
+assert open(os.path.join(checkout, "herdr-calls")).read().splitlines() == \
+    ["notification show acme/app #40: review lỗi (timeout 1s) --sound request"]
+os.remove(os.path.join(review_bin, "runs"))
+open(os.path.join(review_bin, "ok"), "w").close()
+lines, kept = review_round(41)
+assert lines == ["review acme/app#41: posted"] and kept is True and receiver.claim_review("acme/app", 41) is False, (lines, kept)
+assert "pr review 41 --repo acme/app --comment --body-file -" in open(os.path.join(review_bin, "gh-calls")).read()
+# one failure, then the retry posts: claim kept, no notification
+open(os.path.join(receiver.STATE, "reviews.json"), "w").write(json.dumps({"acme/app#42": {"failed": 1}}))
+lines, kept = review_round(42)
+assert lines == ["review acme/app#42: posted"] and kept is True, (lines, kept)
+os.remove(os.path.join(review_bin, "ok"))
+open(os.path.join(receiver.STATE, "reviews.json"), "w").write(json.dumps({"acme/app#9": True}))  # a v0.5.2 claim stays claimed
+assert receiver.claim_review("acme/app", 9) is False
+open(os.path.join(review_bin, "reviewer"), "w").write("#!/bin/sh\necho 'oops' >&2\nexit 3\n")
+assert review_round(43)[0] == ["review acme/app#43: failed (exit 3)"] * 2
+open(os.path.join(receiver.CONFIG, "review_cmd"), "w").write("no-such-reviewer-binary\n")
+assert review_round(44)[0] == ["review acme/app#44: failed (FileNotFoundError)"] * 2
+assert len(open(os.path.join(checkout, "herdr-calls")).read().splitlines()) == 3  # one notification per give-up
+os.remove(os.path.join(receiver.CONFIG, "review_cmd"))
 
 assert receiver.start_tunnel() is None  # no tunnel_cmd: nothing is started
 tunnel_cmd = os.path.join(receiver.CONFIG, "tunnel_cmd")
