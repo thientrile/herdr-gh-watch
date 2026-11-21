@@ -18,7 +18,7 @@ Each event shows a herdr notification and is handed to the [herdr-wake](https://
 - [gh-watch] CI finished (failure) for PR #7 in acme/app — check: gh pr checks 7 -R acme/app
 ```
 
-The agent then reads the PR itself with `gh`. Each event is queued under an id taken from the event itself (`review:<id>`, `comment:<id>`, `run:<id>:<attempt>`, `pr:<id>:merged`, `pr:<id>:auto_merge_<enabled|disabled>:<head sha>`, `behind:<pr>:<head sha>`, `codex:<pr>:<head sha>:slow`), so a redelivery, or the same event found again by [reconcile](#missed-webhooks-reconcile), is queued once. gh-watch never prompts an agent itself: queueing, routing, retries and delivery are herdr-wake's job.
+The agent then reads the PR itself with `gh`. Each event is queued under an id taken from the event itself (`review:<id>`, `comment:<id>`, `run:<id>:<attempt>`, `pr:<id>:merged`, `pr:<id>:auto_merge_<enabled|disabled>:<head sha>`, `behind:<pr>:<head sha>`, `codex:<pr>:<sha>:clean|findings|slow`), so a redelivery, or the same event found again by [reconcile](#missed-webhooks-reconcile), is queued once. gh-watch never prompts an agent itself: queueing, routing, retries and delivery are herdr-wake's job.
 
 ## Install
 
@@ -48,7 +48,7 @@ All files live in `$cfg`; see [`examples/`](examples). Only `repos.tsv` is neede
 | `ignore_users` | GitHub logins, one per line. Reviews and comments they write are skipped (CI results and merges are not). Put your own login here. |
 | `notify_cmd` | Optional. A command that gets `GitHub: <title>` as its last argument, e.g. a Telegram sender. Skipped when the file is missing or the command fails. |
 | `review_repos` | Optional. Repos (`owner/name`, one per line) that get one automated review when a PR is opened or marked ready. |
-| `review_cmd` | Optional, needed for reviews. The reviewer command, e.g. `claude -p`. An argument containing `{prompt}` gets the prompt; otherwise the prompt goes to stdin. Its output is posted as a PR review comment starting with `gh-watch-review:`. |
+| `review_cmd` | Optional, needed for reviews. The reviewer command, e.g. `claude -p`. An argument containing `{prompt}` gets the prompt; otherwise the prompt goes to stdin. Its output is posted as a PR review comment starting with `gh-watch-review:`. It gets 400 s; a timeout, a nonzero exit, empty output or a failed post is logged as `review owner/repo#N: failed (<reason>)` and tried once more (after 60 s unless it timed out), then given up with a notification (`review lỗi`). A failed post is not retried, since GitHub may have stored it. Only a posted review keeps the PR's claim in `reviews.json`. |
 | `review_prompt.txt` | Optional. Replaces the default review prompt, e.g. to describe your project's conventions or ask for another language. The diff is appended after it. |
 | `tunnel_cmd` | Optional. A tunnel command (e.g. `cloudflared tunnel run gh-watch`) started with the receiver and stopped with it; its output goes to `receiver.log`. Read at start only, so restart after editing. Leave it out if you run your tunnel some other way. |
 
@@ -72,9 +72,10 @@ Each event is queued once, to one place. herdr-wake then picks the pane whose cw
 
 Codex (login `chatgpt-codex-connector[bot]`, the `CODEX_BOT` constant in `receiver.py`; change it there if your Codex app posts under another login) is read without forwarding any of its text:
 
-- A comment or review from that login containing its fixed receipt "Didn't find any major issues" is `codex_clean`.
-- A review from it with any other body is `codex_findings`, with the number of its inline comments in the text (`Codex findings (3) on PR #7`).
-- Its inline comments and its `codex-pull-request-review-summary` comment (edited in place) wake nobody: the review above already counts them.
+- Its `codex-pull-request-review-summary` comment, created and then edited in place, carries `<!-- codex-review-state:v1 {json} -->`. When its `code_review.status` is `completed`, `has_any_findings: false` is `codex_clean` and `true` is `codex_findings`, queued as `codex:<pr>:<commit sha>:clean|findings`, so every edit at the same commit is one event. Another status, bad JSON or a missing field is ignored. A findings summary names no branch, so the PR is looked up once to route it to the PR's thread. A second Codex round on the same commit is the same event. This is the only edited comment gh-watch reads; other edits are ignored.
+- A findings review from that login (any body without the receipt below) is `codex_findings`, with the number of its inline comments in the text (`Codex findings (3) on PR #7`), under the same `codex:<pr>:<commit sha>:findings` id as the summary of that round, so the round wakes the thread once.
+- A comment or review containing the older fixed receipt "Didn't find any major issues" is `codex_clean` under its `comment:<id>`. The receipt names only a 10-character sha, so it cannot share the summary's id; Codex no longer writes it.
+- Its inline comments wake nobody: the review above already counts them.
 
 For open PRs, the scan below derives one state per head: **clean**, **findings(n)** or **pending**. It reads the `codex-review-state:v1` summary first (full commit sha, `status`, `has_any_findings`), else the clean receipts (matched on their short "Reviewed commit" sha) and findings reviews. A review of an earlier commit still counts at the head when every later commit is an update-branch merge: two parents, the first the commit before it, the second already in the base branch (`GET /compare`). Codex does not review those merges itself.
 
@@ -99,13 +100,14 @@ GitHub does not retry a webhook delivery that failed, so events that happen whil
 - One GraphQL query over the 50 most recently updated open PRs (merge state, auto-merge, the head's check rollup, review threads, Codex reviews and comments). It queues:
   - `behind` (`behind:<pr>:<head sha>`) when the head's checks are all green (rollup `SUCCESS`), Codex is clean at the head, no review thread is unresolved, and the PR is `BEHIND` its base, or is `CLEAN` (also `HAS_HOOKS`, `UNSTABLE`) with auto-merge off. `DIRTY` and `BLOCKED` have another obstacle and are skipped. The text says which: `PR #7 is ready but behind base` or `... but auto-merge off`. `mergeStateStatus` `UNKNOWN` means GitHub is still computing it, so the PR is skipped until the next poll. Drafts are skipped.
   - `codex_slow` (`codex:<pr>:<head sha>:slow`) when the head commit is older than 30 minutes (`CODEX_SLOW`) but younger than 6 hours (`CODEX_SLOW_MAX`; older heads were never sent to Codex) and Codex has not reviewed it (update-branch merges after a review count as reviewed).
+  - `codex_clean` (`codex:<pr>:<reviewed sha>:clean`, the webhook's id) when Codex is clean at the head and the head is younger than `CODEX_SLOW_MAX`. The events feed carries no comment edits, so this is the safety net for a summary edited to clean while the receiver was down.
 
 Each result is shaped like its webhook and goes through the same path as a live delivery, with the same id, so herdr-wake drops what was already queued. A cursor per repo (`reconcile-<owner>_<repo>.json` in the state dir) holds GitHub's time of the last complete poll; each poll re-reads one hour before it. The cursor only moves when every enqueue succeeded, and the events request sends the ETag, so an unchanged feed costs no rate limit.
 
 - **First start**: the cursor is set to now and nothing older is ever replayed, not even by the one-hour overlap (so events queued by v0.3 under delivery ids are never queued again).
 - **`MAX_LOOKBACK` = 7 days**: a cursor older than that reads from 7 days ago and logs the gap it skipped. herdr-wake must keep ids for dedup longer than this.
 - **At most 20 new wakes per repo per poll** from the events, and 20 from the PR scan; the rest are logged and picked up by the next poll.
-- Results show in `receiver.log` as `reconcile owner/repo: ...` and `scan owner/repo: N behind, M codex slow queued from K open PRs`.
+- Results show in `receiver.log` as `reconcile owner/repo: ...` and `scan owner/repo: N behind, M codex slow, C codex clean queued from K open PRs`.
 
 Limits: the events feed lags behind real time by about 30 seconds to 6 hours and holds only the last 300 events, so an event that shows up in the feed more than an hour after it happened, or that falls out of a busy feed, is missed (when a poll reads all 300 and they are all inside its window, the log says `feed limit 300 reached, events before <time> not read`). Only the newest 100 CI runs per poll are read (the log says how many older ones were skipped). CI runs are matched by when they were created, so a re-run of an old run, or a run that finishes long after it started, can be missed. For anything missed, open the webhook's Recent Deliveries in the repo settings and press **Redeliver**.
 

@@ -177,7 +177,7 @@ def describe(event, payload):
             names = ", ".join(failed[:3]) + (f" +{len(failed) - 3}" if len(failed) > 3 else "")
             return f"{repo}: CI failure", f"CI failed ({names}) for {label}", number
         return f"{repo}: CI {conclusion}", f"CI finished ({conclusion}) for {label}", number
-    if event == "issue_comment" and payload.get("action") == "created" and payload.get("issue", {}).get("pull_request"):
+    if event == "issue_comment" and payload.get("action") in ("created", "edited") and payload.get("issue", {}).get("pull_request"):
         number = payload["issue"]["number"]
         return f"{repo} #{number}: new comment", f"new comment on PR #{number}", number
     if event == "pull_request_review_comment" and payload.get("action") == "created":
@@ -192,11 +192,26 @@ def describe(event, payload):
     return None
 
 
+def codex_summary(body):
+    """(commit sha, "clean" | "findings") of a completed codex-review-state:v1 summary, else None; never raises."""
+    match = CODEX_STATE.search(body)
+    try:
+        code = json.loads(match.group(1))["code_review"] if match else None
+    except (ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(code, dict) or code.get("status") != "completed" or not HEX.fullmatch(str(code.get("commit_sha"))) \
+            or not isinstance(code.get("has_any_findings"), bool):
+        return None
+    return code["commit_sha"], "findings" if code["has_any_findings"] else "clean"
+
+
 def codex_kind(event, payload):
     """codex_clean, codex_findings or "skip" for Codex's own events, None for anyone else's. Bodies are matched, never forwarded."""
     if (payload.get("sender") or {}).get("login") != CODEX_BOT:
         return None
     body = str((payload.get("review") or payload.get("comment") or {}).get("body") or "")
+    if event == "issue_comment" and codex_summary(body):
+        return "codex_" + codex_summary(body)[1]
     if CODEX_CLEAN in body:
         return "codex_clean"
     if event == "pull_request_review":
@@ -208,8 +223,14 @@ def codex_kind(event, payload):
 
 def event_id(event, payload):
     """The enqueue id: the same for a live webhook and its reconciled copy, so herdr-wake stores the event once."""
+    sha = str((payload.get("review") or {}).get("commit_id") or "")
+    if event == "pull_request_review" and codex_kind(event, payload) == "codex_findings" and HEX.fullmatch(sha):
+        return f"codex:{int(payload['pull_request']['number'])}:{sha}:findings"  # the summary of the same round has this id
     if event == "pull_request_review":
         return f"review:{int(payload['review']['id'])}"
+    summary = event == "issue_comment" and codex_kind(event, payload) and codex_summary(str(payload["comment"].get("body") or ""))
+    if summary:  # created, then edited in place per commit: one id per PR and commit
+        return f"codex:{int(payload['issue']['number'])}:{summary[0]}:{summary[1]}"
     if event in ("issue_comment", "pull_request_review_comment"):
         return f"comment:{int(payload['comment']['id'])}"
     if event == "workflow_run":
@@ -246,17 +267,23 @@ def handle(event, payload, repos):
     codex = codex_kind(event, payload)
     if codex == "skip":
         return "ignored (codex)"
+    if payload.get("action") == "edited" and not codex:  # only Codex's summary is edited into a new signal
+        return "ignored"
     feedback = event in ("pull_request_review", "issue_comment", "pull_request_review_comment")
     # only comments and reviews are skipped when you wrote them; CI results and merges you triggered still matter
     is_auto_review = str((payload.get("review") or {}).get("body") or "").startswith(MARK)  # boolean only, the text is never forwarded
     if feedback and not is_auto_review and safe(payload.get("sender", {}).get("login", "")) in ignored_users():
         return "ignored (own activity)"
     head = (payload.get("pull_request") or run).get("head", {}).get("ref") or run.get("head_branch", "")
+    if codex == "codex_findings" and event == "issue_comment":  # the summary names no branch; the thread is routed by it
+        status, _, pr = gh_get(f"repos/{safe(repo, 200)}/pulls/{int(number)}")
+        head = ((pr or {}).get("head") or {}).get("ref") or "" if status == 200 and isinstance(pr, dict) else ""
     if codex == "codex_clean":
         kind, hint, title = codex, f"gh pr view {number} --json mergeStateStatus,autoMergeRequest", f"{safe(repo)} #{number}: Codex clean"
         message = f"Codex found no major issues on PR #{number}"
     elif codex:
-        found = gh_api(f"repos/{safe(repo, 200)}/pulls/{int(number)}/reviews/{int(payload['review']['id'])}/comments?per_page=100")
+        review_id = (payload.get("review") or {}).get("id")  # the summary carries no review and no count
+        found = gh_api(f"repos/{safe(repo, 200)}/pulls/{int(number)}/reviews/{int(review_id)}/comments?per_page=100") if review_id else []
         kind, hint, title = codex, f"gh api repos/{safe(repo, 200)}/pulls/{number}/comments", f"{safe(repo)} #{number}: Codex findings"
         message = f"Codex findings ({len(found) or '?'}) on PR #{number}"
     elif event == "workflow_run":
@@ -455,7 +482,7 @@ HEX = re.compile(r"[0-9a-f]{40}")
 
 
 def codex_state(pr, in_base):
-    """("clean" | "findings" | "pending", n) of Codex for the PR head, from the codex-review-state:v1 summary, else the
+    """("clean" | "findings" | "pending", n, reviewed commit or None) of Codex for the PR head, from the codex-review-state:v1 summary, else the
     clean receipts and findings reviews. A review of an earlier commit still counts when every later commit is an
     update-branch merge: two parents, the first the commit before it, the second already in the base (in_base(sha))."""
     commits, summary_state = [node["commit"] for node in pr["commits"]["nodes"]], None
@@ -467,13 +494,13 @@ def codex_state(pr, in_base):
                 else ("findings", int(review["comments"]["totalCount"]))
     for comment in pr["comments"]["nodes"]:
         body = str(comment.get("body") or "") if (comment.get("author") or {}).get("login") in bot else ""
-        summary = CODEX_STATE.search(body)
+        summary = codex_summary(body)
         receipt = re.search(r"Reviewed commit:\*\* `([0-9a-f]{7,40})`", body) if CODEX_CLEAN in body else None
         if summary:
-            code = (json.loads(summary.group(1)).get("code_review") or {})
-            if code.get("status") == "completed" and HEX.fullmatch(str(code.get("commit_sha"))):
-                sha = code["commit_sha"]
-                summary_state = (sha, ("findings", states.get(sha, ("", 0))[1]) if code.get("has_any_findings") is not False else ("clean", 0))
+            sha = summary[0]
+            summary_state = (sha, ("findings", states.get(sha, ("", 0))[1]) if summary[1] == "findings" else ("clean", 0))
+        elif CODEX_STATE.search(body):
+            continue  # a summary still running or unreadable is no receipt
         elif receipt:
             for oid in oids:
                 if oid.startswith(receipt.group(1)):
@@ -482,16 +509,17 @@ def codex_state(pr, in_base):
         states[summary_state[0]] = summary_state[1]
     reviewed = next((oid for oid in reversed(oids) if oid in states), None)
     if reviewed not in oids:
-        return "pending", 0
+        return "pending", 0, None
     for i in range(oids.index(reviewed) + 1, len(oids)):
         parents = [p["oid"] for p in commits[i]["parents"]["nodes"]]
         if len(parents) != 2 or parents[0] != oids[i - 1] or not in_base(parents[1]):
-            return "pending", 0
-    return states[reviewed]
+            return "pending", 0, None
+    return (*states[reviewed], reviewed)
 
 
 def pr_events(name, pr, now, in_base):
-    """[(kind, id, message, hint)] for one open PR: `behind` when it is ready but waits, `codex_slow` when Codex is late."""
+    """[(kind, id, message, hint)] for one open PR: `behind` when it is ready but waits, `codex_slow` when Codex is late,
+    `codex_clean` when Codex passed a recent head (the summary is edited in place, and the events feed has no edits)."""
     number, head = int(pr["number"]), str(pr["headRefOid"])
     commits = [node["commit"] for node in pr["commits"]["nodes"]]
     if pr["isDraft"] or not HEX.fullmatch(head) or not commits or commits[-1]["oid"] != head:
@@ -502,10 +530,11 @@ def pr_events(name, pr, now, in_base):
     ready = merge in ("BEHIND", "CLEAN", "HAS_HOOKS", "UNSTABLE") and rollup == "SUCCESS" and \
         threads["totalCount"] <= len(threads["nodes"]) and all(t["isResolved"] for t in threads["nodes"])
     age = now - datetime.fromisoformat(str(commits[-1]["committedDate"]).replace("Z", "+00:00"))
-    old = CODEX_SLOW < age < CODEX_SLOW_MAX
-    if not ready and not old:
+    recent = age < CODEX_SLOW_MAX
+    old = CODEX_SLOW < age and recent
+    if not ready and not recent:
         return []
-    state, _ = codex_state(pr, in_base)
+    state, _, reviewed = codex_state(pr, in_base)
     events = []
     if state == "pending" and old:
         events.append(("codex_slow", f"codex:{number}:{head}:slow", f"Codex has not reviewed the head of PR #{number} after 30 min",
@@ -514,11 +543,14 @@ def pr_events(name, pr, now, in_base):
         why = "behind base" if merge == "BEHIND" else "auto-merge off"
         events.append(("behind", f"behind:{number}:{head}", f"PR #{number} is ready but {why}",
                        f"gh pr view {number} --json mergeStateStatus,autoMergeRequest"))
+    if state == "clean" and recent:  # the webhook's id for this commit: wake stores it once
+        events.append(("codex_clean", f"codex:{number}:{reviewed}:clean", f"Codex found no major issues on PR #{number}",
+                       f"gh pr view {number} --json mergeStateStatus,autoMergeRequest"))
     return events
 
 
 def scan(repo, repos):
-    """The open PRs of a repo, read with one GraphQL query, as `behind` and `codex_slow` wakes; a log line."""
+    """The open PRs of a repo, read with one GraphQL query, as `behind`, `codex_slow` and `codex_clean` wakes; a log line."""
     name = safe(repo, 200)
     owner, _, short = name.partition("/")
     status, headers, data = gh_get("graphql", fields=("-f", f"query={SCAN}", "-f", f"owner={owner}", "-f", f"name={short}"))
@@ -527,7 +559,7 @@ def scan(repo, repos):
         now = email.utils.parsedate_to_datetime(headers["date"])  # GitHub's clock, never ours
     except (KeyError, TypeError, ValueError):
         return f"graphql: HTTP {status}"
-    counts, known = {"behind": 0, "codex_slow": 0}, {}
+    counts, known = {"behind": 0, "codex_slow": 0, "codex_clean": 0}, {}
 
     for pr in prs:
         base = str(pr.get("baseRefName") or "")
@@ -552,7 +584,7 @@ def scan(repo, repos):
             except RuntimeError as error:
                 return f"{error}; the next poll tries again"
             counts[kind] += result == "wake enqueued"
-    return f"{counts['behind']} behind, {counts['codex_slow']} codex slow queued from {len(prs)} open PRs"
+    return f"{counts['behind']} behind, {counts['codex_slow']} codex slow, {counts['codex_clean']} codex clean queued from {len(prs)} open PRs"
 
 
 def reconcile_loop():
@@ -590,16 +622,18 @@ def review_repos():
         return set()
 
 
+REVIEW_TIMEOUT, REVIEW_TRIES, REVIEW_RETRY_WAIT = 400, 2, 60  # a round that failed twice is given up, not retried on every event
 CLAIMS = threading.Lock()  # requests run in threads: the read-check-write below must not interleave
 
 
 def claim_review(repo, number):
-    """One round per PR: True only the first time (kept on disk, so a restart does not review twice)."""
+    """One round per PR: the attempt number while it may run, else False (kept on disk, so a restart does not review twice)."""
     with CLAIMS:
         return claim_review_locked(repo, number)
 
 
-def claim_review_locked(repo, number):
+def claim_review_locked(repo, number, release=None):
+    """True in reviews.json is claimed or posted; {"failed": n} is released after n failed attempts."""
     os.makedirs(STATE, exist_ok=True)
     path = os.path.join(STATE, "reviews.json")
     try:
@@ -607,44 +641,88 @@ def claim_review_locked(repo, number):
     except (OSError, ValueError):
         done = {}
     key = f"{repo}#{number}"
-    if key in done:
-        return False
-    done[key] = True
+    if release:
+        done[key] = {"failed": release}
+    else:
+        failed = done[key].get("failed", 0) if isinstance(done.get(key), dict) else REVIEW_TRIES if key in done else 0
+        if failed >= REVIEW_TRIES:
+            return False
+        done[key] = True
     json.dump(done, open(path, "w"))
-    return True
+    return release or failed + 1
 
 
 def run_review(repo, number, post):
+    """posted, dry, or failed (<reason>); never raises."""
+    try:
+        return review(repo, number, post)
+    except subprocess.TimeoutExpired as error:
+        return f"failed (timeout {int(error.timeout)}s)"
+    except (OSError, subprocess.SubprocessError, ValueError) as error:  # ValueError: output that is not text
+        return f"failed ({type(error).__name__})"
+
+
+def review(repo, number, post):
     command = config_cmd("review_cmd")
     if not command:
-        return "no review_cmd"
+        return "failed (no review_cmd)"
     diff = subprocess.run(["gh", "pr", "diff", str(number), "--repo", repo], capture_output=True, text=True, timeout=60).stdout
     if not diff.strip():
-        return "no diff"
+        return "failed (no diff)"
     note = "\n[diff truncated]" if len(diff) > 60000 else ""
     prompt = f"{review_prompt()}\n<diff>\n{diff[:60000]}{note}\n</diff>"
     with tempfile.TemporaryDirectory() as empty:  # an empty directory: the reviewer can read the diff only, never the repo
         # `{prompt}` inside an argument is replaced by the prompt; without one the prompt goes to stdin
         argv = [arg.replace("{prompt}", prompt) for arg in command]
         stdin = None if argv != command else prompt
-        out = subprocess.run(argv, cwd=empty, input=stdin, capture_output=True, text=True, timeout=400).stdout.strip()
+        done = subprocess.run(argv, cwd=empty, input=stdin, capture_output=True, text=True, timeout=REVIEW_TIMEOUT)
+    if done.returncode:
+        return f"failed (exit {done.returncode})"
+    out = done.stdout.strip()
     if not out:
-        return "empty review"
+        return "failed (empty review)"
     body = f"{MARK} automated second-opinion review (one round). Suggestions only, not a merge decision.\n\n{out[:6000]}"
     if not post:
         print("---- review (not posted) ----\n" + body, flush=True)
         return "dry"
-    subprocess.run(["gh", "pr", "review", str(number), "--repo", repo, "--comment", "--body-file", "-"], input=body, capture_output=True, text=True, timeout=60)
-    return "posted"
+    try:
+        posted = subprocess.run(["gh", "pr", "review", str(number), "--repo", repo, "--comment", "--body-file", "-"],
+                                input=body, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired as error:  # its own reason: GitHub may have stored it, unlike a diff timeout
+        return f"failed (gh pr review timeout {int(error.timeout)}s)"
+    return f"failed (gh pr review exit {posted.returncode})" if posted.returncode else "posted"
+
+
+def post_failed(result):
+    return result.startswith("failed (gh pr review")  # GitHub may have stored it
+
+
+def review_round(repo, number, attempt, post):
+    """The claimed round: kept when posted, else released and tried once more; a give-up is logged and notified."""
+    while attempt:
+        result = run_review(repo, number, post)
+        print(f"review {repo}#{number}: {result}", flush=True)
+        if not result.startswith("failed"):
+            return
+        try:
+            with CLAIMS:  # one step: another event must not take the retry in between
+                claim_review_locked(repo, number, release=REVIEW_TRIES if post_failed(result) else attempt)
+                attempt = claim_review_locked(repo, number)
+        except (OSError, ValueError) as error:
+            print(f"review {repo}#{number}: reviews.json: {type(error).__name__}", flush=True)
+            attempt = False
+        if attempt and not result.startswith("failed (timeout"):
+            time.sleep(REVIEW_RETRY_WAIT)  # a fast failure (a diff not ready yet, a rate limit) would fail again at once
+    notify_user(f"{safe(repo)} #{number}: review lỗi ({result[8:-1]})")
 
 
 def maybe_review(event, payload):
     if event != "pull_request" or payload.get("action") not in ("opened", "ready_for_review"):
         return
     pr, repo = payload.get("pull_request") or {}, payload.get("repository", {}).get("full_name", "")
-    if repo not in review_repos() or not config_cmd("review_cmd") or pr.get("draft") or not claim_review(repo, pr.get("number")):
-        return
-    threading.Thread(target=lambda: print(f"review {repo}#{pr['number']}: {run_review(repo, pr['number'], not DRY_RUN)}", flush=True), daemon=True).start()
+    attempt = repo in review_repos() and config_cmd("review_cmd") and not pr.get("draft") and claim_review(repo, pr.get("number"))
+    if attempt:
+        threading.Thread(target=review_round, args=(repo, pr["number"], attempt, not DRY_RUN), daemon=True).start()
 
 
 def start_tunnel():
