@@ -685,13 +685,16 @@ def review(repo, number, post):
     if not post:
         print("---- review (not posted) ----\n" + body, flush=True)
         return "dry"
-    posted = subprocess.run(["gh", "pr", "review", str(number), "--repo", repo, "--comment", "--body-file", "-"],
-                            input=body, capture_output=True, text=True, timeout=60)
+    try:
+        posted = subprocess.run(["gh", "pr", "review", str(number), "--repo", repo, "--comment", "--body-file", "-"],
+                                input=body, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired as error:  # its own reason: GitHub may have stored it, unlike a diff timeout
+        return f"failed (gh pr review timeout {int(error.timeout)}s)"
     return f"failed (gh pr review exit {posted.returncode})" if posted.returncode else "posted"
 
 
 def post_failed(result):
-    return result.startswith("failed (gh pr review") or result == "failed (timeout 60s)"  # GitHub may have stored it
+    return result.startswith("failed (gh pr review")  # GitHub may have stored it
 
 
 def review_round(repo, number, attempt, post):

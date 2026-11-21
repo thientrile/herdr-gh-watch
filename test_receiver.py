@@ -623,6 +623,8 @@ lines, kept = review_round(45)  # the post failed: GitHub may have stored it, so
 assert lines == ["review acme/app#45: failed (gh pr review exit 1)"] and kept == {"failed": 2}, (lines, kept)
 open(os.path.join(review_bin, "gh"), "w").write(f"#!/bin/sh\necho \"$*\" >> {review_bin}/gh-calls\n"
                                                  "[ \"$2\" = diff ] && echo 'diff --git a/x b/x'\nexit 0\n")
+assert not receiver.post_failed("failed (timeout 60s)")  # the diff fetch timed out: nothing was posted, so retry
+assert receiver.post_failed("failed (gh pr review timeout 60s)") and receiver.post_failed("failed (gh pr review exit 1)")
 os.remove(os.path.join(review_bin, "ok"))
 waits = []
 real_sleep = time.sleep  # subprocess polls with short sleeps: only the retry wait is recorded
