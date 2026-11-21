@@ -275,6 +275,9 @@ def handle(event, payload, repos):
     if feedback and not is_auto_review and safe(payload.get("sender", {}).get("login", "")) in ignored_users():
         return "ignored (own activity)"
     head = (payload.get("pull_request") or run).get("head", {}).get("ref") or run.get("head_branch", "")
+    if codex == "codex_findings" and event == "issue_comment":  # the summary names no branch; the thread is routed by it
+        status, _, pr = gh_get(f"repos/{safe(repo, 200)}/pulls/{int(number)}")
+        head = ((pr or {}).get("head") or {}).get("ref") or "" if status == 200 and isinstance(pr, dict) else ""
     if codex == "codex_clean":
         kind, hint, title = codex, f"gh pr view {number} --json mergeStateStatus,autoMergeRequest", f"{safe(repo)} #{number}: Codex clean"
         message = f"Codex found no major issues on PR #{number}"
@@ -619,7 +622,7 @@ def review_repos():
         return set()
 
 
-REVIEW_TIMEOUT, REVIEW_TRIES = 400, 2  # a round that failed twice is given up, not retried on every event
+REVIEW_TIMEOUT, REVIEW_TRIES, REVIEW_RETRY_WAIT = 400, 2, 60  # a round that failed twice is given up, not retried on every event
 CLAIMS = threading.Lock()  # requests run in threads: the read-check-write below must not interleave
 
 
@@ -687,6 +690,10 @@ def review(repo, number, post):
     return f"failed (gh pr review exit {posted.returncode})" if posted.returncode else "posted"
 
 
+def post_failed(result):
+    return result.startswith("failed (gh pr review") or result == "failed (timeout 60s)"  # GitHub may have stored it
+
+
 def review_round(repo, number, attempt, post):
     """The claimed round: kept when posted, else released and tried once more; a give-up is logged and notified."""
     while attempt:
@@ -694,9 +701,15 @@ def review_round(repo, number, attempt, post):
         print(f"review {repo}#{number}: {result}", flush=True)
         if not result.startswith("failed"):
             return
-        with CLAIMS:  # one step: another event must not take the retry in between
-            claim_review_locked(repo, number, release=attempt)
-            attempt = claim_review_locked(repo, number)
+        try:
+            with CLAIMS:  # one step: another event must not take the retry in between
+                claim_review_locked(repo, number, release=REVIEW_TRIES if post_failed(result) else attempt)
+                attempt = claim_review_locked(repo, number)
+        except (OSError, ValueError) as error:
+            print(f"review {repo}#{number}: reviews.json: {type(error).__name__}", flush=True)
+            attempt = False
+        if attempt and not result.startswith("failed (timeout"):
+            time.sleep(REVIEW_RETRY_WAIT)  # a fast failure (a diff not ready yet, a rate limit) would fail again at once
     notify_user(f"{safe(repo)} #{number}: review lỗi ({result[8:-1]})")
 
 

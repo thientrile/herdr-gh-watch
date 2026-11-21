@@ -398,8 +398,15 @@ assert (result, got) == ("wake enqueued", {"id": f"codex:7:{S1}:clean", "kind": 
                                            "text": "Codex found no major issues on PR #7 in acme/app", "branch": None}), (result, got)
 result, got = last("issue_comment", summary_event(S1, action="edited"), 3)
 assert result == "wake duplicate" and got["id"] == f"codex:7:{S1}:clean", (result, got)  # an edit at the same commit
+real_get, pr_gets = receiver.gh_get, []  # an issue comment names no branch: the findings wake looks the PR up for it
+receiver.gh_get = lambda path, etag="", fields=(): pr_gets.append(path) or (200, {}, {"head": {"ref": "feat/x"}})
 result, got = last("issue_comment", summary_event(S2, findings=True, action="edited"), 3)
-assert (got["id"], got["kind"], got["cwd"], got["branch"]) == (f"codex:7:{S2}:findings", "codex_findings", checkout, None), got  # an issue comment names no branch
+assert (got["id"], got["kind"], got["cwd"], got["branch"]) == (f"codex:7:{S2}:findings", "codex_findings", checkout, "feat/x"), got
+assert pr_gets == ["repos/acme/app/pulls/7"], pr_gets
+receiver.gh_get = lambda path, etag="", fields=(): (502, {}, None)  # lookup failed: still queued, to the checkout without a branch
+_, got = last("issue_comment", summary_event("3" * 40, findings=True), 3)
+assert (got["kind"], got["branch"]) == ("codex_findings", None), got
+receiver.gh_get = real_get
 assert got["text"] == "Codex findings (?) on PR #7 in acme/app", got
 for status in ("pending", "in_progress", None):
     assert last("issue_comment", summary_event(S1, status=status), 3) == ("ignored (codex)", None), status
@@ -584,7 +591,7 @@ open(os.path.join(review_bin, "reviewer"), "w").write(f"#!/bin/sh\necho x >> {re
 [os.chmod(os.path.join(review_bin, f), 0o755) for f in ("gh", "reviewer")]
 open(os.path.join(receiver.CONFIG, "review_cmd"), "w").write(f"{review_bin}/reviewer\n")
 os.environ["PATH"] = review_bin + ":" + os.environ["PATH"]
-receiver.HERDR, receiver.REVIEW_TIMEOUT = fake_herdr, 1
+receiver.HERDR, receiver.REVIEW_TIMEOUT, receiver.REVIEW_RETRY_WAIT = fake_herdr, 1, 0.03
 open(fake_herdr, "w").write(f"#!/bin/sh\necho \"$*\" >> {checkout}/herdr-calls\n")
 open(os.path.join(checkout, "herdr-calls"), "w").close()
 
@@ -611,14 +618,35 @@ assert "pr review 41 --repo acme/app --comment --body-file -" in open(os.path.jo
 open(os.path.join(receiver.STATE, "reviews.json"), "w").write(json.dumps({"acme/app#42": {"failed": 1}}))
 lines, kept = review_round(42)
 assert lines == ["review acme/app#42: posted"] and kept is True, (lines, kept)
+open(os.path.join(review_bin, "gh"), "w").write("#!/bin/sh\n[ \"$2\" = diff ] && { echo 'diff --git a/x b/x'; exit 0; }\nexit 1\n")
+lines, kept = review_round(45)  # the post failed: GitHub may have stored it, so no second run and no second post
+assert lines == ["review acme/app#45: failed (gh pr review exit 1)"] and kept == {"failed": 2}, (lines, kept)
+open(os.path.join(review_bin, "gh"), "w").write(f"#!/bin/sh\necho \"$*\" >> {review_bin}/gh-calls\n"
+                                                 "[ \"$2\" = diff ] && echo 'diff --git a/x b/x'\nexit 0\n")
 os.remove(os.path.join(review_bin, "ok"))
+waits = []
+real_sleep = time.sleep  # subprocess polls with short sleeps: only the retry wait is recorded
+receiver.time.sleep = lambda t: waits.append(t) if t == receiver.REVIEW_RETRY_WAIT else real_sleep(t)
+open(os.path.join(review_bin, "reviewer"), "w").write("#!/bin/sh\nexit 0\n")  # a fast failure waits before the retry
+assert review_round(46)[0] == ["review acme/app#46: failed (empty review)"] * 2 and waits == [receiver.REVIEW_RETRY_WAIT], waits
+waits[:] = []
+open(os.path.join(review_bin, "reviewer"), "w").write("#!/bin/sh\nsleep 3\n")
+assert review_round(47)[0] == ["review acme/app#47: failed (timeout 1s)"] * 2 and waits == []  # a timeout already waited
+receiver.time.sleep = real_sleep
+state = receiver.STATE
+receiver.STATE = os.path.join(review_bin, "reviewer")  # not a directory: the claim cannot be written
+out = io.StringIO()
+with contextlib.redirect_stdout(out):
+    receiver.review_round("acme/app", 48, 1, True)  # first attempt times out, the release fails: logged and notified
+assert "review acme/app#48: failed (" in out.getvalue() and "review lỗi" in open(os.path.join(checkout, "herdr-calls")).read().splitlines()[-1]
+receiver.STATE = state
 open(os.path.join(receiver.STATE, "reviews.json"), "w").write(json.dumps({"acme/app#9": True}))  # a v0.5.2 claim stays claimed
 assert receiver.claim_review("acme/app", 9) is False
 open(os.path.join(review_bin, "reviewer"), "w").write("#!/bin/sh\necho 'oops' >&2\nexit 3\n")
 assert review_round(43)[0] == ["review acme/app#43: failed (exit 3)"] * 2
 open(os.path.join(receiver.CONFIG, "review_cmd"), "w").write("no-such-reviewer-binary\n")
 assert review_round(44)[0] == ["review acme/app#44: failed (FileNotFoundError)"] * 2
-assert len(open(os.path.join(checkout, "herdr-calls")).read().splitlines()) == 3  # one notification per give-up
+assert len(open(os.path.join(checkout, "herdr-calls")).read().splitlines()) == 7  # one notification per give-up
 os.remove(os.path.join(receiver.CONFIG, "review_cmd"))
 
 assert receiver.start_tunnel() is None  # no tunnel_cmd: nothing is started
